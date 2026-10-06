@@ -3325,6 +3325,17 @@ class ImageMarkerApp(QMainWindow):
         if not file_name:
             return
 
+        # --------------------------------------------------------------
+        # Auto-fit the voltage color scale to the placed markers:
+        #   Min = lowest marker voltage (all markers)
+        #   Max = highest non-test marker voltage (5 V "Test"
+        #         markers excluded)
+        # Done first, before anything is drawn, so both the on-image
+        # markers and the legend gradient use these values.
+        # --------------------------------------------------------------
+
+        self.auto_fit_color_scale()
+
         try:
             image = (
                 self.canvas.base_image.copy()
@@ -3373,17 +3384,6 @@ class ImageMarkerApp(QMainWindow):
                         30,
                     ),
                 )
-
-            # ----------------------------------------------------------
-            # Auto-fit the voltage color scale to the placed markers:
-            #   Min = lowest marker voltage (all markers)
-            #   Max = highest non-test marker voltage (5 V "Test"
-            #         markers excluded)
-            # Done before drawing so both the on-image markers and the
-            # legend gradient use these values.
-            # ----------------------------------------------------------
-
-            self.auto_fit_color_scale()
 
             # ----------------------------------------------------------
             # Legend (compact box in the top-right corner of the
