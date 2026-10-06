@@ -2554,7 +2554,7 @@ class ImageMarkerApp(QMainWindow):
         )
 
         save_session_action.triggered.connect(
-            self.save_session
+            lambda checked=False: self.save_session()
         )
 
         session_menu.addAction(
@@ -2572,7 +2572,7 @@ class ImageMarkerApp(QMainWindow):
         )
 
         load_session_action.triggered.connect(
-            self.load_session_dialog
+            lambda checked=False: self.load_session_dialog()
         )
 
         session_menu.addAction(
