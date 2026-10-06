@@ -1,8 +1,11 @@
+import os
 import sys
+import json
 import math
 import copy
 import argparse
 import configparser
+from datetime import datetime
 from pathlib import Path
 
 # Offline mode: set from the command line (-o / --offline).
@@ -139,6 +142,76 @@ class Marker:
         self.is_test = bool(is_test)
         self.shape = str(shape) if shape in MARKER_SHAPES else "circle"
 
+    def to_dict(self):
+        """Serialize the marker for session files (see SESSION_VERSION)."""
+        return {
+            "x": self.x,
+            "y": self.y,
+            "size": self.size,
+            "voltage": self.voltage,
+            "is_test": self.is_test,
+            "shape": self.shape,
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        """Rebuild a marker from its serialized dict."""
+        return cls(
+            x=data.get("x", 0.0),
+            y=data.get("y", 0.0),
+            size=data.get("size", 15),
+            voltage=data.get("voltage", 0.0),
+            is_test=data.get("is_test", False),
+            shape=data.get("shape", "circle"),
+        )
+
+
+# ----------------------------------------------------------------------
+# Session files (save / load marking sessions as JSON)
+#
+# A session records everything needed to resume working later:
+#   * the path of the originally opened image (the pixels themselves
+#     are NOT embedded — only the path is stored),
+#   * every placed marker (position, shape, size, voltage, test flag),
+#   * the toolbar parameters (per-shape legend labels, selected shape,
+#     image rotation, marker size, color-scale endpoints),
+#   * optionally the USMELT panel parameters.
+#
+# JSON was chosen because it is human readable, part of the standard
+# library and easy to extend.  ``SESSION_VERSION`` lets future readers
+# cope with older files; unknown keys are ignored on load.
+# ----------------------------------------------------------------------
+
+SESSION_VERSION = 1
+SESSION_EXTENSION = ".usmark.json"
+
+
+def _json_default(obj):
+    """Fallback encoder so stray Qt/path objects never break saving."""
+    if isinstance(obj, Path):
+        return str(obj)
+    return str(obj)
+
+
+def marker_list_to_dicts(markers):
+    return [m.to_dict() for m in markers]
+
+
+def marker_dicts_to_list(data):
+    markers = []
+
+    for entry in data or []:
+        if not isinstance(entry, dict):
+            continue
+
+        try:
+            markers.append(Marker.from_dict(entry))
+        except (TypeError, ValueError):
+            # Skip malformed entries instead of failing the whole load.
+            continue
+
+    return markers
+
 
 # ----------------------------------------------------------------------
 # Shape preview icon (drawn with QPainter for the toolbar rows)
@@ -222,6 +295,11 @@ class ImageCanvas(QWidget):
         self.display_pixmap = QPixmap()
         self.display_rect = QRectF()
 
+        # Path of the file the base image was loaded from (None when no
+        # image is open).  Session files store this path instead of the
+        # pixels, so a session can be reopened later.
+        self.image_path = None
+
         self.zoom = 1.0
         self.rotation = 0.0
 
@@ -235,8 +313,9 @@ class ImageCanvas(QWidget):
 
     # ------------------------------------------------------------------
 
-    def set_image(self, image):
+    def set_image(self, image, image_path=None):
         self.base_image = image.copy()
+        self.image_path = str(image_path) if image_path else None
         self.zoom = 1.0
         self.rotation = 0.0
         self.pan_x = 0.0
@@ -2397,12 +2476,109 @@ class ImageMarkerApp(QMainWindow):
         self.current_voltage = None
         self.current_is_test = False
 
+        # Marking session bookkeeping (see save_session / load_session).
+        self.session_path = None
+        self._session_dirty = False
+
         self.build_menu()
         self.build_ui()
+
+        # Track toolbar edits so the window title can show the "*"
+        # unsaved marker and Save Session can ask before discarding.
+        for edit in self.shape_descriptions.values():
+            edit.textEdited.connect(self._mark_session_dirty)
+
+        self.marker_size_slider.valueChanged.connect(
+            self._mark_session_dirty
+        )
+        self.color_min_spin.valueChanged.connect(
+            self._mark_session_dirty
+        )
+        self.color_max_spin.valueChanged.connect(
+            self._mark_session_dirty
+        )
+        self.rotation_spin.valueChanged.connect(
+            self._mark_session_dirty
+        )
+        self.shape_button_group.buttonClicked.connect(
+            self._mark_session_dirty
+        )
+
+    # ------------------------------------------------------------------
+
+    def _base_window_title(self):
+        if self.offline:
+            return "USMELT + Image Marker (offline)"
+
+        return "USMELT + Image Marker"
+
+    # ------------------------------------------------------------------
+
+    def update_window_title(self):
+        """Reflect the current session file and unsaved changes."""
+        title = self._base_window_title()
+
+        if self.session_path:
+            title += f" — {Path(self.session_path).name}"
+
+        if self._session_dirty:
+            title += " *"
+
+        self.setWindowTitle(title)
+
+    # ------------------------------------------------------------------
+
+    def _mark_session_dirty(self, *args):
+        if not self._session_dirty:
+            self._session_dirty = True
+            self.update_window_title()
 
     # ------------------------------------------------------------------
 
     def build_menu(self):
+        session_menu = (
+            self.menuBar().addMenu(
+                "Session"
+            )
+        )
+
+        save_session_action = QAction(
+            "Save Session…",
+            self,
+        )
+
+        save_session_action.setShortcut("Ctrl+S")
+        save_session_action.setStatusTip(
+            "Save image path, markers and toolbar settings to a "
+            ".usmark.json session file"
+        )
+
+        save_session_action.triggered.connect(
+            self.save_session
+        )
+
+        session_menu.addAction(
+            save_session_action
+        )
+
+        load_session_action = QAction(
+            "Load Session…",
+            self,
+        )
+
+        load_session_action.setShortcut("Ctrl+O")
+        load_session_action.setStatusTip(
+            "Restore a previously saved marking session"
+        )
+
+        load_session_action.triggered.connect(
+            self.load_session_dialog
+        )
+
+        session_menu.addAction(
+            load_session_action
+        )
+
         settings_menu = (
             self.menuBar().addMenu(
                 "Settings"
@@ -3007,6 +3183,7 @@ class ImageMarkerApp(QMainWindow):
         for name, btn in self.shape_buttons.items():
             if btn is button:
                 self.current_shape = name
+                self._mark_session_dirty()
                 return
 
     # ------------------------------------------------------------------
@@ -3105,6 +3282,8 @@ class ImageMarkerApp(QMainWindow):
             self.markers
         )
 
+        self._mark_session_dirty()
+
     # ------------------------------------------------------------------
 
     def undo(self):
@@ -3124,6 +3303,8 @@ class ImageMarkerApp(QMainWindow):
         self.canvas.set_markers(
             self.markers
         )
+
+        self._mark_session_dirty()
 
     # ------------------------------------------------------------------
 
@@ -3145,6 +3326,8 @@ class ImageMarkerApp(QMainWindow):
             self.markers
         )
 
+        self._mark_session_dirty()
+
     # ------------------------------------------------------------------
 
     def clear_markers(self):
@@ -3158,6 +3341,8 @@ class ImageMarkerApp(QMainWindow):
         self.canvas.set_markers(
             self.markers
         )
+
+        self._mark_session_dirty()
 
     # ------------------------------------------------------------------
 
@@ -3240,6 +3425,18 @@ class ImageMarkerApp(QMainWindow):
         if not file_name:
             return
 
+        self._load_image_file(file_name)
+
+    # ------------------------------------------------------------------
+
+    def _load_image_file(self, file_name):
+        """Open an image file and reset the marking state.
+
+        Shared by the "Open Image" button and session loading.  The
+        markers, undo/redo history and rotation are cleared exactly as
+        before; callers that restore a session re-apply their stored
+        values afterwards.  Returns True on success.
+        """
         try:
             image = Image.open(
                 file_name
@@ -3290,7 +3487,8 @@ class ImageMarkerApp(QMainWindow):
             )
 
             self.canvas.set_image(
-                image
+                image,
+                file_name,
             )
 
         except Exception as exc:
@@ -3299,6 +3497,475 @@ class ImageMarkerApp(QMainWindow):
                 "Open Image",
                 f"Could not open image:\n\n{exc}",
             )
+            return False
+
+        return True
+
+    # ------------------------------------------------------------------
+    # Session save / load (JSON files, see SESSION_VERSION)
+    # ------------------------------------------------------------------
+
+    def _session_dir(self):
+        """Suggested folder for session dialogs.
+
+        Prefers the directory of the current session file, then the
+        directory of the open image, and falls back to the home folder.
+        """
+        if self.session_path:
+            return str(Path(self.session_path).parent)
+
+        if getattr(self.canvas, "image_path", None):
+            return str(Path(self.canvas.image_path).parent)
+
+        return str(Path.home())
+
+    # ------------------------------------------------------------------
+
+    def _default_session_name(self):
+        """Suggest <image name>.usmark.json next to the open image."""
+        image_path = getattr(self.canvas, "image_path", None)
+
+        if image_path:
+            return str(
+                Path(image_path).with_suffix("")
+            ) + SESSION_EXTENSION
+
+        return "session" + SESSION_EXTENSION
+
+    # ------------------------------------------------------------------
+
+    def build_session_data(self):
+        """Collect everything a session file must retain."""
+        shape_labels = {
+            name: edit.text()
+            for name, edit in self.shape_descriptions.items()
+        }
+
+        data = {
+            "app": "usmark_gui",
+            "version": SESSION_VERSION,
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "image": {
+                # Only the path is stored — never the pixels.  The
+                # crop offset lets a future version reload the exact
+                # square region even if the source file changed.
+                "path": getattr(self.canvas, "image_path", None),
+                "crop_offset_x": self.canvas.base_image.width // 2
+                if self.canvas.base_image is not None
+                else 0,
+                "crop_offset_y": self.canvas.base_image.height // 2
+                if self.canvas.base_image is not None
+                else 0,
+            },
+            "toolbar": {
+                "rotation": float(self.rotation_spin.value()),
+                "marker_size": int(self.marker_size),
+                "color_min": float(self.color_min_spin.value()),
+                "color_max": float(self.color_max_spin.value()),
+                "current_shape": getattr(self, "current_shape", "circle"),
+                "shape_labels": shape_labels,
+            },
+            "markers": marker_list_to_dicts(self.markers),
+        }
+
+        # USMELT panel parameters are optional extras; older readers
+        # simply ignore this block.
+        melter = getattr(self, "melter", None)
+
+        if melter is not None:
+            data["melter"] = {
+                "use_shaping": bool(melter.use_shaping.isChecked()),
+                "shaping_v1": float(melter.shaping_v1),
+                "shaping_t1": float(melter.shaping_t1),
+                "shaping_v2": float(melter.shaping_v2),
+                "shaping_t2": float(melter.shaping_t2),
+                "melt_sound": bool(melter.melt_sound),
+            }
+
+        return data
+
+    # ------------------------------------------------------------------
+
+    def apply_session_data(self, data):
+        """Restore toolbar settings and markers from a session dict.
+
+        Returns a list of human-readable notes about anything that
+        could not be restored exactly (missing keys, unknown shapes…).
+        """
+        notes = []
+
+        toolbar = data.get("toolbar") or {}
+
+        # --- Shape legend labels (crucial) --------------------------
+        shape_labels = toolbar.get("shape_labels") or {}
+
+        for name, edit in self.shape_descriptions.items():
+            edit.setText(str(shape_labels.get(name, "")))
+
+        # --- Rotation (crucial) -------------------------------------
+        try:
+            rotation = float(toolbar.get("rotation", 0.0))
+        except (TypeError, ValueError):
+            rotation = 0.0
+            notes.append("Invalid rotation value; used 0°.")
+
+        self.rotation_spin.blockSignals(True)
+        self.rotation_spin.setValue(rotation)
+        self.rotation_spin.blockSignals(False)
+
+        self.canvas.set_rotation(rotation)
+
+        # --- Marker size ---------------------------------------------
+        try:
+            size = max(
+                self.marker_size_slider.minimum(),
+                min(int(toolbar.get("marker_size", self.marker_size)),
+                    self.marker_size_slider.maximum()),
+            )
+        except (TypeError, ValueError):
+            size = int(self.marker_size)
+            notes.append("Invalid marker size; kept the current value.")
+
+        self.marker_size_slider.setValue(size)
+
+        # --- Color scale ---------------------------------------------
+        try:
+            cmin = float(toolbar.get("color_min", self.color_min))
+            cmax = float(toolbar.get("color_max", self.color_max))
+        except (TypeError, ValueError):
+            cmin = self.color_min
+            cmax = self.color_max
+            notes.append("Invalid color scale values; kept the current ones.")
+
+        self.color_min_spin.setValue(cmin)
+        self.color_max_spin.setValue(cmax)
+
+        # --- Selected shape -------------------------------------------
+        shape = str(toolbar.get("current_shape", "circle"))
+
+        if shape in self.shape_buttons:
+            self.shape_buttons[shape].setChecked(True)
+            self.current_shape = shape
+        else:
+            self.shape_buttons["circle"].setChecked(True)
+            self.current_shape = "circle"
+
+            if shape != "circle":
+                notes.append(
+                    f"Unknown marker shape '{shape}'; selected circle."
+                )
+
+        # --- Markers ---------------------------------------------------
+        raw_markers = data.get("markers") or []
+
+        self.markers = marker_dicts_to_list(raw_markers)
+
+        restored = len(self.markers)
+
+        if restored != len(raw_markers):
+            notes.append(
+                f"{len(raw_markers) - restored} malformed marker entries "
+                "were skipped."
+            )
+
+        self.undo_stack = []
+        self.redo_stack = []
+
+        self.canvas.set_markers(self.markers)
+
+        # --- Optional USMELT parameters --------------------------------
+        melter_data = data.get("melter")
+
+        if melter_data and hasattr(self, "melter"):
+            melter = self.melter
+
+            try:
+                melter.shaping_v1 = float(
+                    melter_data.get("shaping_v1", melter.shaping_v1))
+                melter.shaping_t1 = float(
+                    melter_data.get("shaping_t1", melter.shaping_t1))
+                melter.shaping_v2 = float(
+                    melter_data.get("shaping_v2", melter.shaping_v2))
+                melter.shaping_t2 = float(
+                    melter_data.get("shaping_t2", melter.shaping_t2))
+
+                melter.use_shaping.blockSignals(True)
+                melter.use_shaping.setChecked(
+                    bool(melter_data.get("use_shaping",
+                                         melter.use_shaping.isChecked()))
+                )
+                melter.use_shaping.blockSignals(False)
+
+                if "melt_sound" in melter_data:
+                    melt_sound = bool(melter_data["melt_sound"])
+
+                    melter.melt_sound = melt_sound
+
+                    self.melt_sound_action.blockSignals(True)
+                    self.melt_sound_action.setChecked(melt_sound)
+                    self.melt_sound_action.blockSignals(False)
+
+                # Shaping changes the effective CH1 voltage, which in
+                # turn drives marker colors and the status label.
+                melter.effective_voltage_changed.emit()
+
+            except (TypeError, ValueError):
+                notes.append(
+                    "USMELT parameters in the session were invalid; "
+                    "kept the current ones."
+                )
+
+        return notes
+
+    # ------------------------------------------------------------------
+
+    def save_session(self, file_name=None):
+        """Write the current marking session to a JSON file."""
+        if self.canvas.base_image is None:
+            QMessageBox.warning(
+                self,
+                "Save Session",
+                "No image is open, so there is nothing to save.",
+            )
+            return False
+
+        if file_name is None:
+            file_name, _selected = QFileDialog.getSaveFileName(
+                self,
+                "Save Session",
+                self._default_session_name(),
+                (
+                    f"USMARK Session (*{SESSION_EXTENSION});;"
+                    "JSON (*.json);;All Files (*)"
+                ),
+            )
+
+            if not file_name:
+                return False
+
+        file_name = str(file_name)
+
+        # Keep the conventional extension so Load can find the file.
+        if not file_name.lower().endswith(".json"):
+            file_name += SESSION_EXTENSION
+
+        data = self.build_session_data()
+
+        try:
+            with open(file_name, "w", encoding="utf-8") as handle:
+                json.dump(
+                    data,
+                    handle,
+                    indent=2,
+                    ensure_ascii=False,
+                    default=_json_default,
+                )
+
+        except OSError as exc:
+            QMessageBox.critical(
+                self,
+                "Save Session",
+                f"Could not save session:\n\n{exc}",
+            )
+            return False
+
+        self.session_path = file_name
+        self._session_dirty = False
+        self.update_window_title()
+
+        self.statusBar().showMessage(
+            f"Session saved to {file_name}",
+            5000,
+        )
+
+        return True
+
+    # ------------------------------------------------------------------
+
+    def load_session_dialog(self, file_name=None):
+        """Ask for a session file (if needed) and restore it."""
+        if file_name is None:
+            file_name, _selected = QFileDialog.getOpenFileName(
+                self,
+                "Load Session",
+                self._session_dir(),
+                (
+                    f"USMARK Session (*{SESSION_EXTENSION});;"
+                    "JSON (*.json);;All Files (*)"
+                ),
+            )
+
+            if not file_name:
+                return False
+
+        if self._session_dirty:
+            answer = QMessageBox.question(
+                self,
+                "Load Session",
+                "The current session has unsaved changes.\n\n"
+                "Save them before loading another session?",
+                QMessageBox.Save
+                | QMessageBox.Discard
+                | QMessageBox.Cancel,
+                QMessageBox.Save,
+            )
+
+            if answer == QMessageBox.Cancel:
+                return False
+
+            if answer == QMessageBox.Save:
+                if not self.save_session():
+                    return False
+
+        return self.load_session(file_name)
+
+    # ------------------------------------------------------------------
+
+    def load_session(self, file_name):
+        """Restore a session previously written by :meth:`save_session`."""
+        file_name = str(file_name)
+
+        try:
+            with open(file_name, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+
+        except FileNotFoundError:
+            QMessageBox.critical(
+                self,
+                "Load Session",
+                f"Session file not found:\n\n{file_name}",
+            )
+            return False
+
+        except json.JSONDecodeError as exc:
+            QMessageBox.critical(
+                self,
+                "Load Session",
+                f"'{Path(file_name).name}' is not a valid session "
+                f"file (corrupted JSON):\n\n{exc}",
+            )
+            return False
+
+        except OSError as exc:
+            QMessageBox.critical(
+                self,
+                "Load Session",
+                f"Could not read session:\n\n{exc}",
+            )
+            return False
+
+        if not isinstance(data, dict) or "markers" not in data:
+            QMessageBox.critical(
+                self,
+                "Load Session",
+                f"'{Path(file_name).name}' does not look like a "
+                "USMARK session file.",
+            )
+            return False
+
+        try:
+            version = int(data.get("version", 0))
+        except (TypeError, ValueError):
+            version = 0
+
+        if version > SESSION_VERSION:
+            QMessageBox.warning(
+                self,
+                "Load Session",
+                f"This session was written by a newer version of the "
+                f"tool (file version {version}, supported "
+                f"{SESSION_VERSION}).\n\nI will load what I recognize; "
+                "unknown fields are ignored.",
+            )
+
+        # --- Reload the original image (only its path is stored) -----
+        image_info = data.get("image") or {}
+        image_path = image_info.get("path")
+
+        image_ok = True
+
+        if image_path:
+            if not os.path.isfile(image_path):
+                image_ok = False
+
+                QMessageBox.warning(
+                    self,
+                    "Load Session",
+                    "The image referenced by the session could not "
+                    f"be found:\n\n{image_path}\n\n"
+                    "Use \"Open Image\" to locate it manually; the "
+                    "markers will keep their saved coordinates.",
+                )
+            else:
+                image_ok = self._load_image_file(image_path)
+
+                if not image_ok:
+                    image_ok = False
+
+        # Re-applying the toolbar state below would otherwise flag the
+        # freshly loaded session as modified.
+        self._loading_session = True
+
+        try:
+            notes = self.apply_session_data(data)
+        finally:
+            self._loading_session = False
+
+        self.session_path = file_name
+        self._session_dirty = False
+        self.update_window_title()
+
+        messages = []
+
+        if not image_path:
+            messages.append("The session did not reference an image file.")
+        elif not image_ok:
+            messages.append("The session's image could not be reloaded.")
+
+        if notes:
+            messages.extend(notes)
+
+        if messages:
+            QMessageBox.information(
+                self,
+                "Load Session",
+                "Session loaded with warnings:\n\n• "
+                + "\n• ".join(messages),
+            )
+        else:
+            self.statusBar().showMessage(
+                f"Session loaded from {file_name}"
+                f" ({len(self.markers)} markers)",
+                5000,
+            )
+
+        return True
+
+    # ------------------------------------------------------------------
+
+    def maybe_save_session_on_close(self):
+        """Give the user a chance to persist unsaved session changes."""
+        if not self._session_dirty:
+            return True
+
+        answer = QMessageBox.question(
+            self,
+            "Unsaved Session",
+            "The current session has unsaved changes.\n\n"
+            "Save them before closing?",
+            QMessageBox.Save
+            | QMessageBox.Discard
+            | QMessageBox.Cancel,
+            QMessageBox.Save,
+        )
+
+        if answer == QMessageBox.Cancel:
+            return False
+
+        if answer == QMessageBox.Save:
+            return bool(self.save_session())
+
+        return True
 
     # ------------------------------------------------------------------
 
