@@ -3444,7 +3444,57 @@ class ImageMarkerApp(QMainWindow):
         return items
 
     @staticmethod
-    def legend_size(image_width, image_height, extra_rows=0):
+    def _format_voltage(voltage):
+        """
+        Format a voltage value for a legend label, trimming trailing
+        zeros ("5.00" -> "5", "3.50" -> "3.5", "3.25" -> "3.25").
+        """
+        text = f"{float(voltage):.2f}".rstrip("0").rstrip(".")
+        return text if text else "0"
+
+    def legend_scale(self):
+        """
+        Compute the color-scale range and tick labels for the figure
+        legend from the markers actually placed on the image.
+
+        Returns ``(vmin, vmax, ticks)`` where:
+          - ``vmin`` is the lowest non-test marker voltage,
+          - ``vmax`` is the highest non-test marker voltage,
+          - ``ticks`` holds one label per distinct non-test voltage
+            present among the markers (5 V markers are excluded: they
+            are the special "Test" case and always appear red).
+
+        When no regular markers exist, the manually set color-scale
+        thresholds are used as a fallback so the bar still renders.
+        """
+        voltages = sorted(
+            {
+                float(marker.voltage)
+                for marker in self.markers
+                if not getattr(marker, "is_test", False)
+            }
+        )
+
+        if not voltages:
+            vmin = float(self.color_min)
+            vmax = float(self.color_max)
+            if vmax < vmin:
+                vmin, vmax = vmax, vmin
+            return vmin, vmax, [vmin, (vmin + vmax) / 2.0, vmax]
+
+        vmin = voltages[0]
+        vmax = voltages[-1]
+
+        if len(voltages) == 1:
+            # Single value: center the tick on a symmetric band so the
+            # gradient (and the marker color) still render sensibly.
+            vmin -= 0.5
+            vmax += 0.5
+
+        return vmin, vmax, voltages
+
+    @staticmethod
+    def legend_size(image_width, image_height, extra_rows=0, scale_rows=0):
         """
         Legend box size scaled to the exported image.
 
@@ -3454,10 +3504,16 @@ class ImageMarkerApp(QMainWindow):
         in the top-right corner instead of dominating the figure.
         Base design grid: 150 x 210 units for a 640 x 480 image, plus
         28 vertical units per shape-key row added below the color
-        scale.
+        scale.  ``scale_rows`` reserves additional height inside the
+        color-scale band for per-marker voltage tick rows when there
+        are more than three distinct voltages to label (capped at 8
+        ticks; beyond that the legend's evenly-spaced label fallback
+        keeps things readable without growing the box).
         """
+        extra_scale = min(5, max(0, int(scale_rows) - 3)) * 22.0
+
         design_w = 150.0
-        design_h = 210.0 + 28.0 * max(0, int(extra_rows))
+        design_h = 210.0 + 28.0 * max(0, int(extra_rows)) + extra_scale
 
         scale = math.sqrt(
             image_width * image_height / (640.0 * 480.0)
@@ -3507,8 +3563,14 @@ class ImageMarkerApp(QMainWindow):
         """
         n_rows = len(key_items) if key_items else 0
 
-        lw, lh = self.legend_size(image_width, image_height,
-                                  extra_rows=n_rows)
+        _, _, ticks = self.legend_scale()
+
+        lw, lh = self.legend_size(
+            image_width,
+            image_height,
+            extra_rows=n_rows,
+            scale_rows=len(ticks),
+        )
 
         # Safety clamp: even for tiny images the legend must fit
         # inside the picture with a small margin.
@@ -3578,8 +3640,20 @@ class ImageMarkerApp(QMainWindow):
             legend_y = margin
 
         # Layout unit: fit a 150 x 210 design grid (+28 units per key
-        # row) inside the box while keeping content proportions correct.
-        design_h = 210.0 + 28.0 * len(key_items)
+        # row, +22 units per color-scale tick row beyond the third)
+        # inside the box while keeping content proportions correct.
+        scale_vmin, scale_vmax, scale_ticks = self.legend_scale()
+
+        # Reserve extra design height for the tick column when there
+        # are more than three distinct voltages to label, so labels
+        # never collide.  The same reservation is mirrored in
+        # legend_size()/legend_layout(); it is capped at 8 ticks
+        # because beyond that the evenly-spaced fallback below keeps
+        # everything inside the band anyway.
+        extra_scale_rows = min(5, max(0, len(scale_ticks) - 3)) * 22.0
+        design_h = (
+            210.0 + 28.0 * len(key_items) + extra_scale_rows
+        )
         s = min(lw / 150.0, lh / design_h)
 
         # Center the design horizontally when the box is wider than tall
@@ -3638,8 +3712,11 @@ class ImageMarkerApp(QMainWindow):
         bar_width = 45 * s
         bar_height = max(18.0 * s, band_bottom - band_top)
 
-        vmax = self.color_max
-        vmin = self.color_min
+        # The scale is driven by the placed markers (lowest/highest
+        # non-test voltage), not the manual thresholds; see
+        # legend_scale().
+        vmax = scale_vmax
+        vmin = scale_vmin
 
         for i in range(int(bar_height)):
             t = i / max(1.0, bar_height - 1.0)
@@ -3680,9 +3757,100 @@ class ImageMarkerApp(QMainWindow):
                 font=label_font,
             )
 
-        draw_label(f"{vmax:.2f}", bar_top)
-        draw_label(f"{(vmin + vmax) / 2.0:.2f}", bar_top + bar_height / 2.0)
-        draw_label(f"{vmin:.2f}", bar_top + bar_height)
+        # ----------------------------------------------------------
+        # Voltage ticks: one label per distinct non-test marker
+        # voltage (5 V excluded - it is the "Test" special case and
+        # always drawn red on the image).  Each value gets a small
+        # tick mark on the bar edge plus its label at the matching
+        # height of the gradient.  When several values are too close
+        # together to label without colliding, their band is spread
+        # evenly so every individual value still gets a label.
+        # ----------------------------------------------------------
+        def layout_ticks(ticks, top, height):
+            """
+            Return collision-free y positions for the tick labels.
+
+            Labels sit at their true gradient heights whenever they
+            fit without overlapping; otherwise the crowded column is
+            spread out as far as the band allows and any remaining
+            tight pairs are relaxed locally.  Every label keeps its
+            own value - only the vertical spacing adapts.
+            """
+            n = len(ticks)
+
+            if n == 0:
+                return []
+
+            # Minimum vertical distance between neighbouring labels
+            # so they can never overlap each other or the shape-key
+            # rows below the band.
+            gap_min = max(label_font.size + 4.0, 16.0 * s)
+
+            lo = top + gap_min / 2.0
+            hi = top + height - gap_min / 2.0
+
+            if n == 1:
+                return [top + height / 2.0]
+
+            span = max(1e-12, vmax - vmin)
+
+            # True gradient mapping (vmax at top).  The extreme
+            # values map exactly onto the band edges.
+            ideal = [
+                top + (vmax - v) / span * height
+                for v in ticks
+            ]
+
+            if all(
+                ideal[i + 1] - ideal[i] >= gap_min for i in range(n - 1)
+            ):
+                return ideal
+
+            usable = max(0.0, hi - lo)
+            step = usable / (n - 1)
+
+            if step < gap_min:
+                # Not enough room for the minimum gap anywhere in
+                # the column: distribute evenly (as far apart as the
+                # legend size allows).
+                return [lo + i * step for i in range(n)]
+
+            # Enough room for a collision-free column: first push
+            # every neighbour pair apart to the minimum gap with a
+            # forward pass (the first label keeps its true position),
+            # then slide the whole column back up into the band when
+            # it overflowed the bottom edge.  This is guaranteed to
+            # converge because the evenly spaced column fits.
+            placed = [ideal[0]]
+            for i in range(1, n):
+                placed.append(max(ideal[i], placed[-1] + gap_min))
+
+            overflow = placed[-1] - hi
+            if overflow > 0:
+                shift = min(overflow, placed[0] - lo)
+                if shift > 0:
+                    placed = [p - shift for p in placed]
+
+            return placed
+
+        tick_len = 6 * s
+
+        tick_positions = layout_ticks(scale_ticks, bar_top, bar_height)
+
+        for v, py in zip(scale_ticks, tick_positions):
+            # Tick mark straddling the right edge of the bar.
+            od.line(
+                [
+                    bar_left + bar_width,
+                    py,
+                    bar_left + bar_width + tick_len,
+                    py,
+                ],
+                fill=(0, 0, 0, 255),
+                width=max(1, int(round(1.5 * s))),
+            )
+
+            draw_label(self._format_voltage(v), py)
 
         # ----------------------------------------------------------
         # Bottom block: shape-key rows (if any) stacked above the
