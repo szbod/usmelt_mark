@@ -3187,12 +3187,16 @@ class ImageMarkerApp(QMainWindow):
         )
 
         if self.color_max <= self.color_min:
-            QMessageBox.warning(
-                self,
-                "Color Scale",
-                "Maximum voltage must be greater than "
-                "minimum voltage.",
-            )
+            # During programmatic auto-fit (export), transient
+            # intermediate states can briefly put min >= max; the
+            # final values are always valid, so skip the popup then.
+            if not getattr(self, "suppress_color_warning", False):
+                QMessageBox.warning(
+                    self,
+                    "Color Scale",
+                    "Maximum voltage must be greater than "
+                    "minimum voltage.",
+                )
 
             return
 
@@ -3371,6 +3375,17 @@ class ImageMarkerApp(QMainWindow):
                 )
 
             # ----------------------------------------------------------
+            # Auto-fit the voltage color scale to the placed markers:
+            #   Min = lowest marker voltage (all markers)
+            #   Max = highest non-test marker voltage (5 V "Test"
+            #         markers excluded)
+            # Done before drawing so both the on-image markers and the
+            # legend gradient use these values.
+            # ----------------------------------------------------------
+
+            self.auto_fit_color_scale()
+
+            # ----------------------------------------------------------
             # Legend (compact box in the top-right corner of the
             # image).  The canvas is never widened, so the exported
             # picture keeps its original size and background.
@@ -3409,6 +3424,78 @@ class ImageMarkerApp(QMainWindow):
     # ------------------------------------------------------------------
     # Voltage legend (drawn onto exported images)
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _format_voltage(value):
+        """
+        Format a voltage for the legend labels: always two decimals
+        ("1.30", "5.00") with trailing zeros trimmed, but never fewer
+        than one decimal place ("1.3", "0.5", "5.0").
+        """
+        text = f"{float(value):.2f}".rstrip("0")
+
+        if text.endswith("."):
+            text += "0"
+
+        return text
+
+    def auto_fit_color_scale(self):
+        """
+        Derive the voltage color scale from the placed markers and
+        sync it to the Color Scale spin boxes:
+
+          Min = lowest voltage among all markers;
+          Max = highest voltage among non-test markers (5 V "Test"
+                markers are excluded).
+
+        When there are no markers at all, or the derived range is
+        degenerate (Max <= Min), the current manual values are kept.
+        """
+        voltages = [marker.voltage for marker in self.markers]
+
+        if not voltages:
+            return
+
+        regular = [
+            marker.voltage
+            for marker in self.markers
+            if not marker.is_test
+        ]
+
+        vmin = min(voltages)
+
+        if regular:
+            vmax = max(regular)
+
+        else:
+            # Only test markers on the image: keep the current max so
+            # the scale stays valid.
+            vmax = self.color_max
+
+        if vmax <= vmin:
+            return
+
+        # Update the spin boxes first: setValue() fires valueChanged,
+        # which routes through color_range_changed() and keeps the
+        # app-level values, the canvas rendering and the export legend
+        # all in sync.  Guard against the warning popup for the
+        # transient intermediate state (e.g. new min > old max).
+        self.suppress_color_warning = True
+
+        try:
+            self.color_min_spin.setValue(vmin)
+            self.color_max_spin.setValue(vmax)
+
+        finally:
+            self.suppress_color_warning = False
+
+        # Re-sync once more in case either value was already at its
+        # target (setValue() then emits nothing and the handler above
+        # returned early without updating both endpoints).
+        self.color_min = self.color_min_spin.value()
+        self.color_max = self.color_max_spin.value()
+
+        self.canvas.render_image()
 
     def used_shapes(self):
         """Distinct marker shapes present on the current image."""
@@ -3680,9 +3767,77 @@ class ImageMarkerApp(QMainWindow):
                 font=label_font,
             )
 
-        draw_label(f"{vmax:.2f}", bar_top)
-        draw_label(f"{(vmin + vmax) / 2.0:.2f}", bar_top + bar_height / 2.0)
-        draw_label(f"{vmin:.2f}", bar_top + bar_height)
+        # ----------------------------------------------------------
+        # Scale labels: one per 0.05 V increment between Min and
+        # Max.  Max sits at the top of the color bar, Min at the
+        # bottom (matching the gradient direction), and each label
+        # is placed at its true height on the bar.  When the
+        # increments would collide (small box or wide range),
+        # every n-th increment is labelled so the labels stay
+        # readable and non-overlapping; the Max and Min end labels
+        # are always drawn.
+        # ----------------------------------------------------------
+
+        step = 0.05
+        n_steps = int(round((vmax - vmin) / step))
+
+        if n_steps < 1:
+            # Range narrower than one increment: label the two ends,
+            # Max on top and Min at the bottom.
+            values = [vmax, vmin]
+
+        else:
+            # Round each tick to 2 decimals against the float ladder
+            # to avoid binary-accumulation artifacts (1.3000000001).
+            values = [round(vmax - k * step, 2) for k in range(n_steps)]
+            values.append(vmin)
+
+        last = len(values) - 1
+
+        # Minimum vertical gap needed between two stacked labels.
+        probe_bbox = od.textbbox((0, 0), "0.00", font=label_font)
+        line_h = probe_bbox[3] - probe_bbox[1]
+        required_gap = line_h + max(2.0, 3.0 * s)
+
+        stride = 1
+        if last > 0 and bar_height > 0:
+            stride = max(
+                1,
+                int(math.ceil(required_gap / (bar_height / last))),
+            )
+
+        shown = []
+        for index, value in enumerate(values):
+            if index % stride == 0:
+                shown.append((index, value))
+
+        # Pin the very first (Max, top) and very last (Min, bottom)
+        # labels so the bar ends are always annotated.  When the tick
+        # count is not divisible by the stride, an added end label can
+        # land closer to its neighbour than one label height; drop the
+        # colliding interior label instead of overlapping it.
+        spacing = bar_height / max(1, last)
+
+        if shown[0][0] != 0:
+            shown.insert(0, (0, values[0]))
+
+            if len(shown) > 1:
+                if (shown[1][0] - 0) * spacing < required_gap:
+                    shown.pop(1)
+
+        if shown[-1][0] != last:
+            if len(shown) >= 2:
+                if (last - shown[-1][0]) * spacing < required_gap:
+                    shown.pop(-1)
+
+            shown.append((last, values[last]))
+
+        for index, value in shown:
+            t = index / max(1, last)
+            draw_label(
+                self._format_voltage(value),
+                bar_top + t * bar_height,
+            )
 
         # ----------------------------------------------------------
         # Bottom block: shape-key rows (if any) stacked above the
