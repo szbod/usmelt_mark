@@ -394,23 +394,22 @@ class ImageCanvas(QWidget):
         t = (float(voltage) - vmin) / (vmax - vmin)
         t = max(0.0, min(1.0, t))
 
-        # Blue -> green -> yellow -> orange
-        # (same colormap as markup.py; an earlier refactor replaced
-        # the anchor colors with a ramp that ended in pure red).
-        blue = (0, 0, 255)
-        green = (0, 255, 0)
-        yellow = (255, 255, 0)
-        orange = (255, 165, 0)
+        # Blue -> cyan -> green -> yellow -> orange -> magenta
+        # (an earlier refactor replaced the anchor colors with a ramp
+        # that ended in pure red; the ramp now spans six anchors).
+        anchors = [
+            (0, 0, 255),      # blue
+            (0, 255, 255),    # cyan
+            (0, 255, 0),      # green
+            (255, 255, 0),    # yellow
+            (255, 165, 0),    # orange
+            (255, 0, 255),    # magenta
+        ]
 
-        if t <= 1.0 / 3.0:
-            u = t * 3.0
-            start, end, u = blue, green, u
-        elif t <= 2.0 / 3.0:
-            u = (t - 1.0 / 3.0) * 3.0
-            start, end, u = green, yellow, u
-        else:
-            u = (t - 2.0 / 3.0) * 3.0
-            start, end, u = yellow, orange, u
+        n = len(anchors) - 1
+        seg = min(int(t * n), n - 1)
+        u = t * n - seg
+        start, end = anchors[seg], anchors[seg + 1]
 
         return tuple(
             int(start[i] + (end[i] - start[i]) * u)
@@ -3718,8 +3717,9 @@ class ImageMarkerApp(QMainWindow):
         band_top = 45 * s
         band_bottom = lh - bottom_block
 
-        # Gradient bar: blue (bottom, Min) -> green -> yellow -> orange
-        # (top, Max).  Narrower than before (bar takes ~1/3 of width).
+        # Gradient bar: blue (bottom, Min) -> cyan -> green -> yellow
+        # -> orange -> magenta (top, Max).  Narrower than before (bar
+        # takes ~1/3 of width).
         bar_left = ox + 40 * s
         bar_top = band_top
         bar_width = 45 * s
