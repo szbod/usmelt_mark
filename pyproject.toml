@@ -10,6 +10,10 @@ license = {text = "BSD-3-Clause"}
 requires-python = ">=3.7"
 dependencies = [
     "pyserial",
+    # usmark_gui.py (the image-marker GUI) is built on Qt; markup.py too.
+    "PySide6",
+    # usmark_gui.py uses Pillow for opening/exporting annotated images.
+    "Pillow",
     # playsound was dropped: it fails to install on Python >= 3.12
     # (its setup.py dies with UnicodeDecodeError).
     # simpleaudio is also gone: no wheels for modern Pythons, segfault issues.
