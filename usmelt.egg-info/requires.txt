@@ -1,2 +1,4 @@
 pyserial
-playsound
+
+[:sys_platform != "win32"]
+soundfile
