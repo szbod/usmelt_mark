@@ -11,7 +11,14 @@ requires-python = ">=3.7"
 dependencies = [
     "pyserial",
     # usmark_gui.py (the image-marker GUI) is built on Qt; markup.py too.
-    "PySide6",
+    # Pinned to 6.8.3: newer PySide6 wheels ship very long internal paths
+    # (e.g. .../assetdownloader/objects-Debug/...) which crash pip with
+    # OSError [Errno 2] on Windows when Long Path support is unavailable,
+    # and Python 3.13 from the Microsoft Store does not reliably allow
+    # enabling it. 6.8.x has cp313 Windows wheels and shorter paths.
+    # Pin shiboken6 to the matching version: PySide6 requires it at ==X.Y.Z.
+    "PySide6-Essentials==6.8.3",
+    "shiboken6==6.8.3",
     # usmark_gui.py uses Pillow for opening/exporting annotated images.
     "Pillow",
     # playsound was dropped: it fails to install on Python >= 3.12
