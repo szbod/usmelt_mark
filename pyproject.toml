@@ -10,7 +10,12 @@ license = {text = "BSD-3-Clause"}
 requires-python = ">=3.7"
 dependencies = [
     "pyserial",
-    "playsound",
+    # playsound was dropped: it fails to install on Python >= 3.12
+    # (its setup.py dies with UnicodeDecodeError).
+    # simpleaudio is also gone: no wheels for modern Pythons, segfault issues.
+    # Sound playback uses winsound on Windows (stdlib) and soundfile+numpy as a
+    # cross-platform fallback (prebuilt wheels on Windows/Linux/macOS).
+    'soundfile; sys_platform != "win32"',
 ]
 classifiers = [
     "Programming Language :: Python :: 3",

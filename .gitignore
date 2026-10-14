@@ -1,4 +1,3 @@
 __pycache__/
 *.pyc
-build/
-usmelt.egg-info/
+*.egg-info/

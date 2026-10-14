@@ -4,11 +4,34 @@ import usmelt
 import time
 import configparser
 import os
-# Use playsound instead of simpleaudio due to
-# avoid the seg fault reported in https://github.com/hamiltron/py-simple-audio/issues/72
-# as simpleaudio is not actively maintained.
-import winsound
 import pathlib
+
+# winsound only exists on Windows; on other platforms fall back to soundfile.
+# (playsound was dropped because it fails to install on Python >= 3.12;
+# simpleaudio is avoided due to missing wheels for modern Pythons and a
+# reported segfault: https://github.com/hamiltron/py-simple-audio/issues/72)
+try:
+    import winsound
+except ImportError:
+    winsound = None
+    try:
+        import soundfile
+    except ImportError:
+        soundfile = None
+import threading
+
+
+def play_sound(path):
+    """Play a sound file without blocking the GUI thread."""
+    if winsound is not None:
+        threading.Thread(
+            target=winsound.PlaySound,
+            args=(str(path), winsound.SND_FILENAME | winsound.SND_ASYNC),
+            daemon=True,
+        ).start()
+    elif soundfile is not None:
+        data, samplerate = soundfile.read(str(path))
+        soundfile.play(data, samplerate=samplerate, block=False)
 
 class MelterApp:
     def __init__(self, master):
@@ -364,7 +387,7 @@ class MelterApp:
             if self.enable_ch1_var.get() or self.enable_ch2_var.get():
                 if self.melt_sound_var.get():
                     sound_effect_path = pathlib.Path(__file__).parent / 'sounds' / 'short-laser-sfx.wav'
-                    winsound.PlaySound(str(sound_effect_path), winsound.SND_FILENAME)
+                    play_sound(sound_effect_path)
                     
                 self.pg.channel(1)  # Trigger from channel 1, even if output is off
                 self.pg.trigger()

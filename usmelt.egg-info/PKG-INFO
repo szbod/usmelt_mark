@@ -8,7 +8,7 @@ Classifier: Programming Language :: Python :: 3
 Requires-Python: >=3.7
 Description-Content-Type: text/markdown
 Requires-Dist: pyserial
-Requires-Dist: playsound
+Requires-Dist: soundfile; sys_platform != "win32"
 
 # usmelt
 
