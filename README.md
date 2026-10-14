@@ -9,6 +9,16 @@ It currently controls:
 
 To install it simply run `pip install .` inside the source directory, like any python package.
 
+Notes for a fresh PC:
+
+- On **Linux**, the sound-effect dependency (SimpleAudio) is compiled from source and
+  needs ALSA headers plus a C compiler. Install them first, e.g. on Debian/Ubuntu:
+  `sudo apt install build-essential libasound2-dev`
+- On **Windows** no extra system packages are needed (the wheel builds with MSVC or a
+  prebuilt wheel is used).
+- On **macOS**, playsound==1.2.2 is installed instead of SimpleAudio to avoid a known
+  seg fault in SimpleAudio on that platform.
+
 ## Usage
 
 Just run `python usmelt_gui.py` from inside the source directory.

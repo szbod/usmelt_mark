@@ -4,11 +4,30 @@ import usmelt
 import time
 import configparser
 import os
-# Use playsound instead of simpleaudio due to
-# avoid the seg fault reported in https://github.com/hamiltron/py-simple-audio/issues/72
-# as simpleaudio is not actively maintained.
-import playsound
+# Use SimpleAudio (aka py-simple-audio) instead of playsound on most platforms
+# because playsound 1.3.0 fails to build its wheel on Python 3.12+
+# (https://github.com/TaunoTakanen/PyPlaysound/issues/47).
+# On macOS we keep playsound==1.2.2, which still works there and avoids
+# SimpleAudio's seg fault reported in https://github.com/hamiltron/py-simple-audio/issues/72
 import pathlib
+import sys
+
+if sys.platform == "darwin":
+    import playsound as _playsound_module
+
+    def play_sound(path):
+        _playsound_module.playsound(str(path))
+else:
+    try:
+        import simpleaudio as _simpleaudio
+
+        def play_sound(path):
+            wave_obj = _simpleaudio.WaveObject.from_wave_file(str(path))
+            wave_obj.play()
+    except ImportError:
+        # No audio backend available; silently skip the sound effect.
+        def play_sound(path):
+            pass
 
 class MelterApp:
     def __init__(self, master):
@@ -249,7 +268,7 @@ class MelterApp:
             if self.enable_ch1_var.get() or self.enable_ch2_var.get():
                 if self.melt_sound_var.get():
                     sound_effect_path = pathlib.Path(__file__).parent / 'sounds' / 'short-laser-sfx.wav'
-                    playsound.playsound(str(sound_effect_path))
+                    play_sound(sound_effect_path)
                 self.pg.channel(1)  # Trigger from channel 1, even if output is off
                 self.pg.trigger()
 

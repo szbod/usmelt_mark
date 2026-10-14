@@ -1,0 +1,10 @@
+README.md
+pyproject.toml
+usmelt/__init__.py
+usmelt/discovery.py
+usmelt/tg5012a.py
+usmelt.egg-info/PKG-INFO
+usmelt.egg-info/SOURCES.txt
+usmelt.egg-info/dependency_links.txt
+usmelt.egg-info/requires.txt
+usmelt.egg-info/top_level.txt
