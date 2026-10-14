@@ -388,9 +388,51 @@ class TG5012A:
                 raise ValueError("Instrument returned execution error %s" % (err))
         if(self.auto_local and cmd != "LOCAL"):
             self.local()
-                    
         return ret
-    
+                    
+    def write_raw(self, data):
+        """Write raw bytes directly to the instrument"""
+        pg_logger.debug(data)
+        if self.sock:
+            return self.sock.send(data)
+        elif self.ser:
+            return self.ser.write(data)
+        else:
+            raise ConnectionError("No connection to instrument")
+
+    def upload_arb(self, name, points, interpolation="OFF"):
+        """Defines and uploads an arbitrary waveform to the specified slot (e.g. 'ARB1')
+        
+        points: a list/array of integers in the range [-8192, 8191]
+        """
+        if name not in ["ARB1", "ARB2", "ARB3", "ARB4"]:
+            raise ValueError("Waveform slot must be ARB1, ARB2, ARB3, or ARB4")
+            
+        # 1. Define the waveform name and interpolation
+        user_name = name
+        self.set("ARBDEF", f"{name},{user_name},{interpolation}")
+        
+        # 2. Resize the arbitrary waveform slot
+        self.set("ARBRESIZE", f"{name},{len(points)}")
+        
+        # 3. Format the binary data block according to IEEE 488.2
+        import struct
+        binary_data = struct.pack(f">{len(points)}h", *points)
+        
+        bytes_len = len(binary_data)
+        len_str = str(bytes_len)
+        header = f"#{len(len_str)}{len_str}".encode('ascii')
+        
+        full_command = name.encode('ascii') + b" " + header + binary_data + b"\n"
+        
+        # Write directly to the instrument
+        self.write_raw(full_command)
+        
+        if self.error_check:
+            err = self.execution_error()
+            if int(err) != 0:
+                raise ValueError("Instrument returned execution error %s after uploading arbitrary waveform" % (err))
+
     def write(self, str):
         """Write str to the instrument encoded as ascii as terminated"""
         pg_logger.debug(str)
