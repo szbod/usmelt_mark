@@ -1,0 +1,7 @@
+pyserial
+
+[:platform_system != "Darwin"]
+SimpleAudio>=1.0.4
+
+[:platform_system == "Darwin"]
+playsound==1.2.2
