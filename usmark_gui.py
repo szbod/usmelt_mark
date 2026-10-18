@@ -235,7 +235,7 @@ def draw_marker_shape(draw, shape, cx, cy, size, fill, outline=(0, 0, 0),
 
 
 class Marker:
-    def __init__(self, x, y, size=15, voltage=0.0, is_test=False,
+    def __init__(self, x, y, size=40, voltage=0.0, is_test=False,
                  shape="circle"):
         self.x = float(x)
         self.y = float(y)
@@ -261,7 +261,7 @@ class Marker:
         return cls(
             x=data.get("x", 0.0),
             y=data.get("y", 0.0),
-            size=data.get("size", 15),
+            size=data.get("size", 40),
             voltage=data.get("voltage", 0.0),
             is_test=data.get("is_test", False),
             shape=data.get("shape", "circle"),
@@ -2570,7 +2570,7 @@ class ImageMarkerApp(QMainWindow):
         self.undo_stack = []
         self.redo_stack = []
 
-        self.marker_size = 15
+        self.marker_size = 40
 
         self.color_min = 1.0
         self.color_max = 2.0
@@ -2855,7 +2855,7 @@ class ImageMarkerApp(QMainWindow):
         )
 
         self.marker_size_slider.setValue(
-            15
+            40
         )
 
         self.marker_size_slider.valueChanged.connect(
@@ -2863,7 +2863,7 @@ class ImageMarkerApp(QMainWindow):
         )
 
         self.marker_size_label = QLabel(
-            "15 px"
+            "40 px"
         )
 
         self.marker_size_label.setFixedWidth(
