@@ -148,6 +148,33 @@ def wrap_text_to_width(draw, text, font, max_width):
     return lines
 
 
+# Markers placed at exactly this voltage are "Test" markers: they are
+# rendered with the fixed test color and are not counted as real
+# sample markers (see the marker counter in the left task bar).
+TEST_VOLTAGE = 5.0
+
+
+def is_test_voltage(voltage):
+    """True if ``voltage`` corresponds to a "Test" marker (5 V)."""
+    try:
+        return math.isclose(
+            float(voltage),
+            TEST_VOLTAGE,
+            abs_tol=1e-9,
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def count_real_markers(markers):
+    """Number of markers that are *not* "Test" (5 V) markers."""
+    return sum(
+        1
+        for marker in markers
+        if not getattr(marker, "is_test", False)
+    )
+
+
 def draw_marker_shape(draw, shape, cx, cy, size, fill, outline=(0, 0, 0),
                       width=None):
     """Draw a marker of the given shape centered at (cx, cy).
@@ -3207,6 +3234,45 @@ class ImageMarkerApp(QMainWindow):
             marker_group
         )
 
+        # --------------------------------------------------------------
+        # Marker counter (bottom of the left task bar)
+        #
+        # Shows how many "real" markers are currently placed in the
+        # session, i.e. all markers except the "Test" ones (the markers
+        # whose voltage is 5 V).  It is refreshed whenever markers are
+        # added / undone / cleared / loaded (update_marker_counter).
+        # --------------------------------------------------------------
+
+        self.marker_counter_label = QLabel(
+            "Markers (non-test): 0"
+        )
+
+        self.marker_counter_label.setObjectName(
+            "markerCounterLabel"
+        )
+
+        self.marker_counter_label.setAlignment(
+            Qt.AlignCenter
+        )
+
+        self.marker_counter_label.setStyleSheet(
+            "QLabel#markerCounterLabel {"
+            " padding: 6px;"
+            " border: 1px solid palette(mid);"
+            " background: palette(base);"
+            " font-weight: bold;"
+            " }"
+        )
+
+        self.marker_counter_label.setToolTip(
+            "Number of markers currently placed in this session,\n"
+            "excluding \"Test\" markers (voltage = 5 V)."
+        )
+
+        left_layout.addWidget(
+            self.marker_counter_label
+        )
+
         # ==============================================================
         # IMAGE CANVAS
         # ==============================================================
@@ -3239,6 +3305,9 @@ class ImageMarkerApp(QMainWindow):
         )
 
         self.update_marker_voltage_state()
+
+        # Initial state of the non-test marker counter.
+        self.update_marker_counter()
 
     # ------------------------------------------------------------------
 
@@ -3287,10 +3356,8 @@ class ImageMarkerApp(QMainWindow):
 
             return
 
-        self.current_is_test = math.isclose(
-            voltage,
-            5.0,
-            abs_tol=1e-9,
+        self.current_is_test = is_test_voltage(
+            voltage
         )
 
         self.voltage_status_label.setText(
@@ -3306,6 +3373,37 @@ class ImageMarkerApp(QMainWindow):
         # the panel always matches the colors of the markers.
         if self.canvas.base_image is not None:
             self.canvas.render_image()
+
+    # ------------------------------------------------------------------
+
+    def update_marker_counter(self):
+        """Refresh the non-test marker counter in the left task bar.
+
+        "Test" markers (the ones placed at a voltage of 5 V) are not
+        counted; only the real sample markers are.  The label lives at
+        the bottom of the left-side tool bar and is updated in real
+        time whenever the marker list changes (add / undo / redo /
+        clear / new image / load session).
+        """
+        if not hasattr(self, "marker_counter_label"):
+            return
+
+        total = len(self.markers)
+
+        non_test = count_real_markers(
+            self.markers
+        )
+
+        test_count = total - non_test
+
+        text = f"Markers (non-test): {non_test}"
+
+        if test_count:
+            text += f"  ·  Test: {test_count}  ·  Total: {total}"
+
+        self.marker_counter_label.setText(
+            text
+        )
 
     # ------------------------------------------------------------------
 
@@ -3340,10 +3438,8 @@ class ImageMarkerApp(QMainWindow):
             y=y,
             size=self.marker_size,
             voltage=voltage,
-            is_test=math.isclose(
-                voltage,
-                5.0,
-                abs_tol=1e-9,
+            is_test=is_test_voltage(
+                voltage
             ),
             shape=getattr(self, "current_shape", "circle"),
         )
@@ -3355,6 +3451,8 @@ class ImageMarkerApp(QMainWindow):
         self.canvas.set_markers(
             self.markers
         )
+
+        self.update_marker_counter()
 
         self._mark_session_dirty()
 
@@ -3378,6 +3476,8 @@ class ImageMarkerApp(QMainWindow):
             self.markers
         )
 
+        self.update_marker_counter()
+
         self._mark_session_dirty()
 
     # ------------------------------------------------------------------
@@ -3400,6 +3500,8 @@ class ImageMarkerApp(QMainWindow):
             self.markers
         )
 
+        self.update_marker_counter()
+
         self._mark_session_dirty()
 
     # ------------------------------------------------------------------
@@ -3415,6 +3517,8 @@ class ImageMarkerApp(QMainWindow):
         self.canvas.set_markers(
             self.markers
         )
+
+        self.update_marker_counter()
 
         self._mark_session_dirty()
 
@@ -3564,6 +3668,9 @@ class ImageMarkerApp(QMainWindow):
                 image,
                 file_name,
             )
+
+            # The marker list was reset together with the image.
+            self.update_marker_counter()
 
         except Exception as exc:
             QMessageBox.critical(
@@ -3746,6 +3853,8 @@ class ImageMarkerApp(QMainWindow):
         self.redo_stack = []
 
         self.canvas.set_markers(self.markers)
+
+        self.update_marker_counter()
 
         # --- Optional USMELT parameters --------------------------------
         melter_data = data.get("melter")
