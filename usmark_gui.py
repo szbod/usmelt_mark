@@ -74,6 +74,80 @@ import usmelt
 MARKER_SHAPES = ("circle", "triangle", "square", "star")
 
 
+def wrap_text_to_width(draw, text, font, max_width):
+    """
+    Word-wrap ``text`` so every rendered line fits within
+    ``max_width`` pixels.
+
+    Returns a list of lines (at least one).  A single word that is
+    longer than the available width is broken across lines character
+    by character, so nothing ever gets clipped horizontally and the
+    result can never loop forever on pathological input (e.g. an
+    empty font or a zero-width box).
+    """
+
+    def text_w(s):
+        bbox = draw.textbbox((0, 0), s, font=font)
+        return bbox[2] - bbox[0]
+
+    def break_word(word):
+        # Split one oversized word into width-fitting chunks.
+        chunks = []
+        current = ""
+
+        for ch in word:
+            trial = current + ch
+            if current and text_w(trial) > max_width:
+                chunks.append(current)
+                current = ch
+            else:
+                current = trial
+
+        if current:
+            chunks.append(current)
+
+        return chunks if chunks else [""]
+
+    lines = []
+
+    for paragraph in str(text).split("\n"):
+        words = paragraph.split()
+
+        if not words:
+            lines.append("")
+            continue
+
+        current = ""
+
+        for word in words:
+            candidate = f"{current} {word}" if current else word
+
+            if text_w(candidate) <= max_width:
+                current = candidate
+                continue
+
+            # The candidate does not fit: flush what we have.
+            if current:
+                lines.append(current)
+                current = ""
+
+            if text_w(word) <= max_width:
+                current = word
+            else:
+                # Single word wider than the box: hard-break it so
+                # the long label stays fully readable instead of
+                # running off the edge of the legend.
+                chunks = break_word(word)
+                for chunk in chunks[:-1]:
+                    lines.append(chunk)
+                current = chunks[-1]
+
+        if current:
+            lines.append(current)
+
+    return lines
+
+
 def draw_marker_shape(draw, shape, cx, cy, size, fill, outline=(0, 0, 0),
                       width=None):
     """Draw a marker of the given shape centered at (cx, cy).
@@ -4196,8 +4270,73 @@ class ImageMarkerApp(QMainWindow):
 
         return items
 
+    # Shape-key text wraps inside this fraction of the legend's
+    # design width (150 units); shared by the layout pass that sizes
+    # the box and the draw pass that renders the rows, so the two
+    # always agree on how many lines each label needs.
+    KEY_TEXT_WIDTH_UNITS = 100.0
+
+    # Extra design height added per wrapped line beyond the first in
+    # a shape-key row (base row band is 28 units).
+    KEY_LINE_EXTRA_UNITS = 22.0
+
+    # Smallest text column (design units) that wrapping ever targets;
+    # keeps the wrap budget positive for tiny legends and guarantees
+    # the sizing pass and the draw pass agree on the wrap width.
+    MIN_KEY_TEXT_UNITS = 40.0
+
     @staticmethod
-    def legend_size(image_width, image_height, extra_rows=0):
+    def _key_text_budget_units(s):
+        """
+        Pixel width available to wrapped key-label text at layout
+        scale ``s``: the space right of the shape icon, with a fixed
+        floor so both passes always use the same number.
+        """
+        used = max(ImageMarkerApp.MIN_KEY_TEXT_UNITS,
+                   ImageMarkerApp.KEY_TEXT_WIDTH_UNITS - 18.0)
+        return used * s
+
+    @staticmethod
+    def _key_row_line_counts(key_items, lw, lh):
+        """
+        Number of wrapped text lines each shape-key row needs at the
+        final legend geometry.
+
+        Returns a list aligned with ``key_items`` (>= 1 line per
+        entry).  Uses PIL metrics from the same font the drawing code
+        picks, so long labels get enough vertical room in the box
+        instead of running past its edge.
+        """
+        if not key_items:
+            return []
+
+        n_rows = len(key_items)
+
+        # Rough estimate first; create_legend refines s with the
+        # exact final lh, but the row heights are constant in design
+        # units so this converges immediately for any sane geometry.
+        design_h_est = 210.0 + 28.0 * n_rows
+        s_est = min(lw / 150.0, lh / design_h_est)
+
+        probe = Image.new("RGBA", (8, 8))
+        probe_draw = ImageDraw.Draw(probe)
+        label_font = ImageMarkerApp._legend_font(
+            max(9, int(round(16 * s_est)))
+        )
+
+        counts = []
+        for _, text in key_items:
+            lines = wrap_text_to_width(
+                probe_draw, str(text), label_font,
+                max(1.0, ImageMarkerApp._key_text_budget_units(s_est)),
+            )
+            counts.append(max(1, len(lines)))
+
+        return counts
+
+    @staticmethod
+    def legend_size(image_width, image_height, extra_rows=0,
+                    key_line_counts=None):
         """
         Legend box size scaled to the exported image.
 
@@ -4208,9 +4347,25 @@ class ImageMarkerApp(QMainWindow):
         Base design grid: 150 x 210 units for a 640 x 480 image, plus
         28 vertical units per shape-key row added below the color
         scale.
+
+        ``key_line_counts`` optionally gives the number of wrapped
+        text lines each shape-key row occupies (one entry per row);
+        rows with more than one line reserve extra height so their
+        labels stay fully visible instead of being cut off.
         """
+        counts = list(key_line_counts or [])
+        n_rows = max(int(extra_rows), len(counts))
+
+        # Design height of the shape-key block: 28 units per row plus
+        # one extra line (22 units) for every wrapped line beyond the
+        # first; matches the line spacing used when drawing the rows.
+        key_block_units = sum(
+            28.0 + ImageMarkerApp.KEY_LINE_EXTRA_UNITS * max(0, c - 1)
+            for c in counts[:n_rows]
+        ) if counts else 28.0 * n_rows
+
         design_w = 150.0
-        design_h = 210.0 + 28.0 * max(0, int(extra_rows))
+        design_h = 210.0 + key_block_units
 
         scale = math.sqrt(
             image_width * image_height / (640.0 * 480.0)
@@ -4260,8 +4415,20 @@ class ImageMarkerApp(QMainWindow):
         """
         n_rows = len(key_items) if key_items else 0
 
+        # First pass without wrap info, then measure how many lines
+        # the labels need at that geometry and resize so tall rows
+        # fit inside the box (labels never get cut off).
         lw, lh = self.legend_size(image_width, image_height,
                                   extra_rows=n_rows)
+
+        key_line_counts = self._key_row_line_counts(key_items, lw, lh)
+
+        if any(c > 1 for c in key_line_counts):
+            lw, lh = self.legend_size(
+                image_width, image_height,
+                extra_rows=n_rows,
+                key_line_counts=key_line_counts,
+            )
 
         # Safety clamp: even for tiny images the legend must fit
         # inside the picture with a small margin.
@@ -4331,8 +4498,17 @@ class ImageMarkerApp(QMainWindow):
             legend_y = margin
 
         # Layout unit: fit a 150 x 210 design grid (+28 units per key
-        # row) inside the box while keeping content proportions correct.
-        design_h = 210.0 + 28.0 * len(key_items)
+        # row, plus one extra line of 22 units for every wrapped text
+        # line beyond the first) inside the box while keeping content
+        # proportions correct.
+        key_line_counts = self._key_row_line_counts(key_items, lw, lh)
+
+        key_block_units = sum(
+            28.0 + self.KEY_LINE_EXTRA_UNITS * max(0, c - 1)
+            for c in key_line_counts
+        ) if key_items else 0.0
+
+        design_h = 210.0 + key_block_units
         s = min(lw / 150.0, lh / design_h)
 
         # Center the design horizontally when the box is wider than tall
@@ -4379,7 +4555,7 @@ class ImageMarkerApp(QMainWindow):
 
         # Bottom block height (shape-key rows + the Test line).
         bottom_block = 30.0 * s if key_items else 24.0 * s
-        bottom_block += 28.0 * s * len(key_items)
+        bottom_block += key_block_units * s
 
         band_top = 45 * s
         band_bottom = lh - bottom_block
@@ -4509,10 +4685,10 @@ class ImageMarkerApp(QMainWindow):
         # ----------------------------------------------------------
         # Bottom block: shape-key rows (if any) stacked above the
         # "Test" line.  Rows are laid out sequentially from the bottom
-        # of the box upward, each in its own band, so nothing can
+        # of the box upward, each in its own band (bands grow for
+        # labels that wrap onto several lines), so nothing can
         # collide with the color scale above or with each other.
         # ----------------------------------------------------------
-        row_h = 28.0 * s
         icon_r = 8.0 * s
         dot_r = 9.0 * s
         icon_cx = ox + 15 * s
@@ -4547,9 +4723,23 @@ class ImageMarkerApp(QMainWindow):
         )
 
         # Shape key: one row per (shape, description) directly above
-        # the Test line.
-        for index, (shape_name, text) in enumerate(reversed(key_items)):
-            cy = test_cy - row_h * (index + 1)
+        # the Test line.  Long descriptions wrap onto extra lines
+        # within the row's reserved band (the legend box was grown to
+        # fit them), so labels never run past the edge of the box.
+        # Rows are stacked bottom-up; ``row_bottom`` tracks the y of
+        # the lowest free pixel of the remaining stack.
+        line_gap_units = self.KEY_LINE_EXTRA_UNITS
+
+        row_bottom = test_cy - 15.0 * s
+
+        for (shape_name, text), n_lines in zip(
+            reversed(key_items), reversed(key_line_counts)
+        ):
+            block_h_units = 28.0 + line_gap_units * max(0, n_lines - 1)
+            block_h = block_h_units * s
+
+            cy = row_bottom - block_h / 2.0
+            row_bottom -= block_h
 
             # Draw the shape itself (gray fill, black outline) so
             # the key matches what appears on the image.
@@ -4622,17 +4812,38 @@ class ImageMarkerApp(QMainWindow):
 
             text_x = icon_cx + icon_r + 10 * s
 
-            bbox = od.textbbox((0, 0), text, font=label_font)
+            # Wrap the label inside the space left of the text column
+            # so a long description stays readable instead of being
+            # cut off at the legend's right edge.  The budget comes
+            # from the same helper the sizing pass used, so the box
+            # always has exactly enough room for these lines.
+            max_text_w = self._key_text_budget_units(s)
 
-            od.text(
-                (
-                    text_x,
-                    cy - (bbox[3] - bbox[1]) / 2.0 - bbox[1],
-                ),
-                text,
-                fill=(0, 0, 0, 255),
-                font=label_font,
+            lines = wrap_text_to_width(
+                od, str(text), label_font, max(1.0, max_text_w)
             )
+
+            line_bbox = od.textbbox((0, 0), "Ag", font=label_font)
+            line_h = (line_bbox[3] - line_bbox[1]) or (16.0 * s)
+
+            total_h = line_h * len(lines)
+
+            for line_index, line in enumerate(lines):
+                bbox = od.textbbox((0, 0), line, font=label_font)
+
+                od.text(
+                    (
+                        text_x,
+                        cy
+                        - total_h / 2.0
+                        + line_index * line_h
+                        - (bbox[3] - bbox[1]) / 2.0
+                        - bbox[1],
+                    ),
+                    line,
+                    fill=(0, 0, 0, 255),
+                    font=label_font,
+                )
 
         rgba = image.convert("RGBA")
 
