@@ -253,12 +253,18 @@ class Marker:
             "voltage": self.voltage,
             "is_test": self.is_test,
             "shape": self.shape,
+            # True for the most recently placed marker.  The highlight
+            # ring itself is GUI-only (never drawn into exported
+            # images); this flag merely records *which* marker should
+            # carry it so the position survives a saved session and the
+            # user can find where they left off after an interruption.
+            "last": bool(getattr(self, "is_last", False)),
         }
 
     @classmethod
     def from_dict(cls, data):
         """Rebuild a marker from its serialized dict."""
-        return cls(
+        marker = cls(
             x=data.get("x", 0.0),
             y=data.get("y", 0.0),
             size=data.get("size", 40),
@@ -266,6 +272,10 @@ class Marker:
             is_test=data.get("is_test", False),
             shape=data.get("shape", "circle"),
         )
+
+        marker.is_last = bool(data.get("last", False))
+
+        return marker
 
 
 # ----------------------------------------------------------------------
@@ -311,6 +321,16 @@ def marker_dicts_to_list(data):
         except (TypeError, ValueError):
             # Skip malformed entries instead of failing the whole load.
             continue
+
+    # Exactly one marker may carry the "last placed" highlight; a
+    # hand-edited or legacy file could contain none or several.  Keep
+    # the last flagged entry (falling back to no highlight at all is
+    # also fine — sessions saved before this feature simply have no
+    # "last" key and nothing is highlighted until a new marker lands).
+    flagged = [m for m in markers if getattr(m, "is_last", False)]
+
+    for m in flagged[:-1]:
+        m.is_last = False
 
     return markers
 
@@ -667,6 +687,79 @@ class ImageCanvas(QWidget):
             self.display_pixmap,
             source_rect,
         )
+
+        # ------------------------------------------------------------------
+        # "Last placed marker" highlight (GUI-only overlay).
+        #
+        # A dashed double ring around the most recently placed marker so
+        # an interrupted session can be resumed at a glance.  It is
+        # painted directly on the widget — never into display_image —
+        # so exported images and any pixel readback of the canvas are
+        # unaffected.
+        # ------------------------------------------------------------------
+        last_marker = next(
+            (m for m in reversed(self.markers)
+             if getattr(m, "is_last", False)),
+            None,
+        )
+
+        if last_marker is not None and self.base_image is not None:
+            rw = self.display_image.width
+            rh = self.display_image.height
+
+            # Base-image coords -> rotated-display coords.
+            if abs(self.rotation) > 1e-9:
+                bx = float(last_marker.x) - self.base_image.width / 2.0
+                by = float(last_marker.y) - self.base_image.height / 2.0
+
+                theta = math.radians(-self.rotation)
+                cos_t = math.cos(theta)
+                sin_t = math.sin(theta)
+
+                ix = bx * cos_t - by * sin_t + rw / 2.0
+                iy = bx * sin_t + by * cos_t + rh / 2.0
+            else:
+                ix = float(last_marker.x)
+                iy = float(last_marker.y)
+
+            # Display-image coords -> widget coords.
+            wx = (self.display_rect.left()
+                  + ix * self.display_rect.width() / rw)
+            wy = (self.display_rect.top()
+                  + iy * self.display_rect.height() / rh)
+
+            # Marker radius in widget pixels (marker size is stored
+            # in base-image pixels; both axes share one scale).
+            r_px = (int(last_marker.size) / 2.0
+                    * self.display_rect.width() / rw)
+
+            ring_r = max(r_px + 4.0, 8.0)
+
+            painter.setRenderHint(QPainter.Antialiasing, True)
+
+            # Dark halo underneath so the ring stays visible on
+            # bright backgrounds too.
+            pen_dark = QPen(QColor(0, 0, 0, 200), 3.0)
+            pen_dark.setStyle(Qt.SolidLine)
+            painter.setPen(pen_dark)
+            painter.drawEllipse(
+                QPointF(wx, wy), ring_r, ring_r)
+
+            # Bright dashed ring on top.
+            pen_bright = QPen(QColor(255, 255, 0, 235), 1.6)
+            pen_bright.setStyle(Qt.DashLine)
+            painter.setPen(pen_bright)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawEllipse(
+                QPointF(wx, wy), ring_r, ring_r)
+
+            # Small inward second ring makes the marker unmistakable.
+            inner_r = max(r_px + 1.5, 4.0)
+            pen_inner = QPen(QColor(255, 255, 0, 170), 1.2)
+            pen_inner.setStyle(Qt.SolidLine)
+            painter.setPen(pen_inner)
+            painter.drawEllipse(
+                QPointF(wx, wy), inner_r, inner_r)
 
     # ------------------------------------------------------------------
 
@@ -3450,6 +3543,28 @@ class ImageMarkerApp(QMainWindow):
 
     # ------------------------------------------------------------------
 
+    def update_last_marker_flag(self):
+        """Keep exactly one marker flagged as 'last placed'.
+
+        The flag drives the GUI-only highlight ring (see
+        ImageCanvas.paintEvent) so an interrupted session can be
+        resumed at a glance.  It is stored in session files but never
+        drawn into exported images.
+
+        Callers must invoke this *before* handing the list to
+        canvas.set_markers() so the repaint shows the new state.
+        """
+        for marker in self.markers:
+            marker.is_last = False
+
+        if self.markers:
+            # The most recently placed marker is simply the last one
+            # in the list (markers are appended in placement order and
+            # undo/redo restore whole snapshots of that list).
+            self.markers[-1].is_last = True
+
+    # ------------------------------------------------------------------
+
     def save_undo_state(self):
         self.undo_stack.append(
             copy.deepcopy(
@@ -3491,6 +3606,8 @@ class ImageMarkerApp(QMainWindow):
             marker
         )
 
+        self.update_last_marker_flag()
+
         self.canvas.set_markers(
             self.markers
         )
@@ -3514,6 +3631,8 @@ class ImageMarkerApp(QMainWindow):
         self.markers = (
             self.undo_stack.pop()
         )
+
+        self.update_last_marker_flag()
 
         self.canvas.set_markers(
             self.markers
@@ -3539,6 +3658,8 @@ class ImageMarkerApp(QMainWindow):
             self.redo_stack.pop()
         )
 
+        self.update_last_marker_flag()
+
         self.canvas.set_markers(
             self.markers
         )
@@ -3556,6 +3677,9 @@ class ImageMarkerApp(QMainWindow):
         self.save_undo_state()
 
         self.markers = []
+
+        # Nothing left to highlight (empty list -> no flagged marker).
+        self.update_last_marker_flag()
 
         self.canvas.set_markers(
             self.markers
@@ -3894,6 +4018,13 @@ class ImageMarkerApp(QMainWindow):
 
         self.undo_stack = []
         self.redo_stack = []
+
+        # Re-flag the most recently placed marker so the highlight ring
+        # survives an interrupted session.  If the file was saved by a
+        # version without the "last" key (or every flagged entry was
+        # dropped as malformed), fall back to the final marker in
+        # placement order — that is where the user left off anyway.
+        self.update_last_marker_flag()
 
         self.canvas.set_markers(self.markers)
 
