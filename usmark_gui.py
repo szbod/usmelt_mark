@@ -398,6 +398,10 @@ class ShapeIconWidget(QWidget):
 
 class ImageCanvas(QWidget):
     marker_added = Signal(float, float)
+    # Emitted when the user right-clicks on the image; the app then
+    # places a marker AND triggers the same action as the "Melt"
+    # button (except in offline mode, where only the marker is placed).
+    melt_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__()
@@ -817,6 +821,40 @@ class ImageCanvas(QWidget):
 
     # ------------------------------------------------------------------
 
+    def _emit_marker_at(self, pos):
+        """
+        Map a widget position to base-image coordinates and, if it
+        lands inside the image, emit marker_added. Returns True when
+        a marker placement was emitted.
+        """
+        rotated = self.widget_to_rotated_image(
+            pos.toPoint()
+        )
+
+        if rotated is None:
+            return False
+
+        base = self.rotated_to_base_image(
+            *rotated
+        )
+
+        if base is None:
+            return False
+
+        bx, by = base
+
+        if (
+            self.base_image is not None
+            and 0 <= bx < self.base_image.width
+            and 0 <= by < self.base_image.height
+        ):
+            self.marker_added.emit(bx, by)
+            return True
+
+        return False
+
+    # ------------------------------------------------------------------
+
     def mousePressEvent(self, event):
         if event.button() == Qt.MiddleButton:
             self.middle_dragging = True
@@ -825,28 +863,14 @@ class ImageCanvas(QWidget):
             return
 
         if event.button() == Qt.LeftButton:
-            rotated = self.widget_to_rotated_image(
-                event.position().toPoint()
-            )
+            self._emit_marker_at(event.position())
+            return
 
-            if rotated is None:
-                return
-
-            base = self.rotated_to_base_image(
-                *rotated
-            )
-
-            if base is None:
-                return
-
-            bx, by = base
-
-            if (
-                self.base_image is not None
-                and 0 <= bx < self.base_image.width
-                and 0 <= by < self.base_image.height
-            ):
-                self.marker_added.emit(bx, by)
+        if event.button() == Qt.RightButton:
+            # Right-click: place a marker AND fire the "Melt" button
+            # action (the app skips the melt itself in offline mode).
+            if self._emit_marker_at(event.position()):
+                self.melt_requested.emit()
 
     # ------------------------------------------------------------------
 
@@ -1504,6 +1528,20 @@ class MelterPanel(QGroupBox):
             self.melt
         )
 
+        if not self.offline:
+            # Document the right-click shortcut on the image canvas.
+            self.melt_button.setToolTip(
+                "Tip: right-clicking on the image places a marker\n"
+                "and runs this Melt action in one step."
+            )
+        else:
+            self.melt_button.setToolTip(
+                "Disabled because the application was started "
+                "with --offline; no pulse generator is connected.\n"
+                "Right-clicking on the image therefore only places "
+                "a marker (no melt)."
+            )
+
         main_layout.addWidget(
             self.melt_button
         )
@@ -1960,16 +1998,22 @@ class MelterPanel(QGroupBox):
 
     # ------------------------------------------------------------------
 
-    def melt(self):
+    def melt(self, quiet_offline=False):
         """
         Program TG5012A using CURRENT GUI values.
 
         The hardware API calls follow the original USMELT code.
+
+        ``quiet_offline``: set by the right-click-on-canvas path so
+        that offline mode silently skips the pulse instead of popping
+        up an information dialog on every click.
         """
 
         if self.offline:
             # Should not normally happen (button is disabled), but
             # guard against keyboard activation or programmatic use.
+            if quiet_offline:
+                return
             QMessageBox.information(
                 self,
                 "Offline mode",
@@ -3387,6 +3431,13 @@ class ImageMarkerApp(QMainWindow):
             self.add_marker
         )
 
+        # Right-click on the image: place a marker (marker_added) and
+        # also fire the "Melt" button action. In offline mode melt()
+        # silently skips the pulse, so only the marker is placed.
+        self.canvas.melt_requested.connect(
+            self.on_canvas_melt_requested
+        )
+
         main_layout.addWidget(
             scroll
         )
@@ -3615,6 +3666,21 @@ class ImageMarkerApp(QMainWindow):
         self.update_marker_counter()
 
         self._mark_session_dirty()
+
+    # ------------------------------------------------------------------
+
+    def on_canvas_melt_requested(self):
+        """
+        Slot for ImageCanvas.melt_requested (right-click on the image).
+
+        Runs the same action as the "Melt" button. In offline mode the
+        melt is skipped silently (the marker placement already happened
+        via marker_added), so right-clicking just places a marker.
+        """
+        if self.offline:
+            return
+
+        self.melter.melt(quiet_offline=True)
 
     # ------------------------------------------------------------------
 
