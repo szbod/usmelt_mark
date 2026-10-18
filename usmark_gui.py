@@ -297,12 +297,74 @@ class Marker:
 SESSION_VERSION = 1
 SESSION_EXTENSION = ".usmark.json"
 
+# Crash protection: the session is auto-saved in the background after
+# every marker placement/removal (see ImageMarkerApp.autosave_session).
+# Exactly one autosave file exists, stored in a sub-directory next to
+# this program; opening a new image starts a new session and simply
+# overwrites it.  On startup the most recent autosave is offered for
+# recovery (see maybe_restore_autosave_on_startup).
+AUTOSAVE_DIRNAME = "autosaves"
+AUTOSAVE_FILE_NAME = "autosave.usmark.json"
+
+
+def _autosave_dir():
+    """Folder holding the single crash-recovery autosave file."""
+    return Path(__file__).resolve().parent / AUTOSAVE_DIRNAME
+
 
 def _json_default(obj):
     """Fallback encoder so stray Qt/path objects never break saving."""
     if isinstance(obj, Path):
         return str(obj)
     return str(obj)
+
+
+def _write_json_atomically(path, data):
+    """Write JSON safely: temp file in the target folder + atomic rename.
+
+    Used by the autosave (and regular session saves) so a crash that
+    happens *during* the write can never leave a half-written file at
+    the destination — readers always see either the previous complete
+    snapshot or the new complete one.  Raises OSError on failure so
+    callers can handle it (autosave treats it as best-effort).
+    """
+    path = Path(path)
+
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    tmp_path = path.with_name(path.name + ".tmp")
+
+    try:
+        with open(
+            tmp_path,
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            json.dump(
+                data,
+                handle,
+                indent=2,
+                ensure_ascii=False,
+                default=_json_default,
+            )
+
+        os.replace(
+            tmp_path,
+            path,
+        )
+
+    except OSError:
+        # Never leave litter behind if the write failed midway.
+        try:
+            tmp_path.unlink(missing_ok=True)
+
+        except OSError:
+            pass
+
+        raise
 
 
 def marker_list_to_dicts(markers):
@@ -2719,6 +2781,12 @@ class ImageMarkerApp(QMainWindow):
         self.session_path = None
         self._session_dirty = False
 
+        # Set to True as soon as a session file is successfully loaded
+        # so the autosave can be dropped on a clean exit; while it is
+        # set, _load_image_file() will NOT overwrite the autosave with
+        # an empty state when re-opening the session's image.
+        self._session_loaded_ok = False
+
         self.build_menu()
         self.build_ui()
 
@@ -2771,6 +2839,202 @@ class ImageMarkerApp(QMainWindow):
         if not self._session_dirty:
             self._session_dirty = True
             self.update_window_title()
+
+    # ------------------------------------------------------------------
+
+    def _on_marker_list_changed(self):
+        """Bookkeeping hook called after every marker placement or
+        removal (add / undo / redo / clear).
+
+        Flags the session as modified and mirrors it to the single
+        background autosave file so a crash loses at most the action
+        that triggered this call.
+        """
+        self._mark_session_dirty()
+        self.autosave_session()
+
+    # ------------------------------------------------------------------
+    # Autosave (crash protection)
+    #
+    # The session is mirrored to a single background file every time a
+    # marker is placed or removed, so an unexpected crash loses at most
+    # the action that triggered it.  See AUTOSAVE_DIRNAME /
+    # AUTOSAVE_FILE_NAME above for where the file lives.
+    # ------------------------------------------------------------------
+
+    def _autosave_path(self):
+        return _autosave_dir() / AUTOSAVE_FILE_NAME
+
+    # ------------------------------------------------------------------
+
+    def autosave_session(self):
+        """Silently mirror the current session to the autosave file.
+
+        Never raises and never shows dialogs — it runs in the
+        background after every marker placement/removal.  There is
+        only ever one autosave file: each call overwrites the
+        previous snapshot (opening a new image counts as starting a
+        new session and simply replaces the old autosave too).
+        """
+        # While a session file is being restored we must not overwrite
+        # the autosave with half-applied state; load_session triggers
+        # an explicit autosave once everything is in place.
+        if getattr(self, "_loading_session", False):
+            return False
+
+        # Nothing open yet -> nothing worth protecting.
+        if self.canvas.base_image is None:
+            return False
+
+        path = self._autosave_path()
+
+        data = self.build_session_data()
+
+        # Provenance markers so startup can tell an autosave apart
+        # from a regular session file.  Older readers ignore unknown
+        # keys, so this stays backward compatible.
+        data["autosave"] = True
+        data["autosave_of"] = (
+            str(self.session_path) if self.session_path else None
+        )
+
+        try:
+            # Written atomically (temp file + rename): a crash during
+            # the write itself can never leave a half-written autosave
+            # behind.
+            _write_json_atomically(
+                path,
+                data,
+            )
+
+        except OSError:
+            # Disk full, permissions, ... — autosave is best-effort;
+            # never interrupt the user's work over it.
+            return False
+
+        self._autosave_available = True
+
+        return True
+
+    # ------------------------------------------------------------------
+
+    def discard_autosave(self):
+        """Remove the autosave file (clean exits / recovered sessions)."""
+        try:
+            self._autosave_path().unlink(missing_ok=True)
+
+        except OSError:
+            pass
+
+    # ------------------------------------------------------------------
+
+    def maybe_restore_autosave_on_startup(self):
+        """Offer to reopen the last auto-saved session on startup.
+
+        Returns True when the autosave was restored into the window.
+        Silently drops autosaves whose image no longer exists (e.g.
+        files coming from another computer), so the prompt only ever
+        appears for sessions that can actually be resumed.
+        """
+        path = self._autosave_path()
+
+        if not path.is_file():
+            return False
+
+        try:
+            with open(
+                path,
+                "r",
+                encoding="utf-8",
+            ) as handle:
+                data = json.load(handle)
+
+        except (OSError, ValueError):
+            # Corrupted autosave (shouldn't happen thanks to the
+            # atomic write, but a manually edited file could): get rid
+            # of it and start fresh.
+            self.discard_autosave()
+
+            return False
+
+        if (
+            not isinstance(data, dict)
+            or "markers" not in data
+        ):
+            self.discard_autosave()
+
+            return False
+
+        image_path = (data.get("image") or {}).get("path")
+
+        if not image_path or not os.path.isfile(str(image_path)):
+            # The referenced image is gone (moved/renamed or saved on
+            # another machine) — nothing sensible to restore.
+            self.discard_autosave()
+
+            return False
+
+        marker_count = len(data.get("markers") or [])
+
+        answer = QMessageBox.question(
+            self,
+            "Restore Autosaved Session?",
+            "USMARK found an auto-saved session from "
+            f"{self._format_saved_age(data.get('saved_at'))}:\n\n"
+            f"Image: {Path(image_path).name}\n"
+            f"Markers: {marker_count}\n\n"
+            "Would you like to resume where you left off?\n\n"
+            "(Choosing No starts with a blank slate; the autosave "
+            "file will be kept until your next marker placement "
+            "overwrites it.)",
+            QMessageBox.Yes
+            | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+
+        if answer != QMessageBox.Yes:
+            return False
+
+        if not self.load_session(path):
+            return False
+
+        # Keep the recovered snapshot around until the next real change
+        # overwrites it, so quitting right after recovery still leaves
+        # the same recoverable state.
+        self.autosave_session()
+
+        return True
+
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _format_saved_age(saved_at):
+        """Human-readable 'how long ago' for the autosave timestamp."""
+        try:
+            saved = datetime.fromisoformat(str(saved_at))
+
+            seconds = max(
+                0,
+                int((datetime.now() - saved).total_seconds()),
+            )
+
+        except (TypeError, ValueError):
+            return "an earlier run"
+
+        if seconds < 90:
+            return "just now"
+
+        minutes = seconds // 60
+
+        if minutes < 60:
+            return f"about {minutes} min ago"
+
+        hours = minutes // 60
+
+        if hours < 24:
+            return f"about {hours} h ago"
+
+        return f"on {saved.strftime('%Y-%m-%d')}"
 
     # ------------------------------------------------------------------
 
@@ -3665,7 +3929,7 @@ class ImageMarkerApp(QMainWindow):
 
         self.update_marker_counter()
 
-        self._mark_session_dirty()
+        self._on_marker_list_changed()
 
     # ------------------------------------------------------------------
 
@@ -3706,7 +3970,7 @@ class ImageMarkerApp(QMainWindow):
 
         self.update_marker_counter()
 
-        self._mark_session_dirty()
+        self._on_marker_list_changed()
 
     # ------------------------------------------------------------------
 
@@ -3732,7 +3996,7 @@ class ImageMarkerApp(QMainWindow):
 
         self.update_marker_counter()
 
-        self._mark_session_dirty()
+        self._on_marker_list_changed()
 
     # ------------------------------------------------------------------
 
@@ -3753,7 +4017,7 @@ class ImageMarkerApp(QMainWindow):
 
         self.update_marker_counter()
 
-        self._mark_session_dirty()
+        self._on_marker_list_changed()
 
     # ------------------------------------------------------------------
 
@@ -3847,6 +4111,10 @@ class ImageMarkerApp(QMainWindow):
         markers, undo/redo history and rotation are cleared exactly as
         before; callers that restore a session re-apply their stored
         values afterwards.  Returns True on success.
+
+        Opening a new image counts as starting a new session, so the
+        single autosave snapshot is overwritten right away (see
+        :meth:`autosave_session`).
         """
         try:
             image = Image.open(
@@ -3904,6 +4172,21 @@ class ImageMarkerApp(QMainWindow):
 
             # The marker list was reset together with the image.
             self.update_marker_counter()
+
+            # Opening a *new* image starts a new session: mirror it to
+            # the autosave immediately so the previous session's
+            # snapshot is overwritten (there is only ever one autosave
+            # file).  Two moments during "Load Session" are skipped:
+            # while the stored markers are being re-applied
+            # (_loading_session) and right after a successful restore
+            # (_session_loaded_ok) — otherwise opening the session's
+            # own image would clobber the recovery snapshot with an
+            # empty marker list before the markers get restored.
+            if (
+                not getattr(self, "_loading_session", False)
+                and not getattr(self, "_session_loaded_ok", False)
+            ):
+                self.autosave_session()
 
         except Exception as exc:
             QMessageBox.critical(
@@ -4143,7 +4426,12 @@ class ImageMarkerApp(QMainWindow):
     # ------------------------------------------------------------------
 
     def save_session(self, file_name=None):
-        """Write the current marking session to a JSON file."""
+        """Write the current marking session to a JSON file.
+
+        Also refreshes the autosave snapshot so crash protection
+        covers the newly saved state (and so the "Load Session"
+        prompt about unsaved changes disappears immediately).
+        """
         if self.canvas.base_image is None:
             QMessageBox.warning(
                 self,
@@ -4175,14 +4463,10 @@ class ImageMarkerApp(QMainWindow):
         data = self.build_session_data()
 
         try:
-            with open(file_name, "w", encoding="utf-8") as handle:
-                json.dump(
-                    data,
-                    handle,
-                    indent=2,
-                    ensure_ascii=False,
-                    default=_json_default,
-                )
+            _write_json_atomically(
+                file_name,
+                data,
+            )
 
         except OSError as exc:
             QMessageBox.critical(
@@ -4194,7 +4478,13 @@ class ImageMarkerApp(QMainWindow):
 
         self.session_path = file_name
         self._session_dirty = False
+        self._session_loaded_ok = True
         self.update_window_title()
+
+        # The state is now safely on disk in the real session file, so
+        # the autosave snapshot is refreshed to match (and the recovery
+        # prompt disappears on the next start after a clean exit).
+        self.autosave_session()
 
         self.statusBar().showMessage(
             f"Session saved to {file_name}",
@@ -4329,6 +4619,11 @@ class ImageMarkerApp(QMainWindow):
         # freshly loaded session as modified.
         self._loading_session = True
 
+        # A fresh load starts from the stored state only; until the
+        # restore succeeds, opening the session's image must still be
+        # allowed to refresh the autosave (see _load_image_file).
+        self._session_loaded_ok = False
+
         try:
             notes = self.apply_session_data(data)
         finally:
@@ -4336,7 +4631,13 @@ class ImageMarkerApp(QMainWindow):
 
         self.session_path = file_name
         self._session_dirty = False
+        self._session_loaded_ok = True
         self.update_window_title()
+
+        # Mirror the restored session to the autosave so crash
+        # protection immediately covers the newly loaded state (this
+        # also overwrites whatever the previous session left there).
+        self.autosave_session()
 
         messages = []
 
@@ -4389,6 +4690,27 @@ class ImageMarkerApp(QMainWindow):
             return bool(self.save_session())
 
         return True
+
+    # ------------------------------------------------------------------
+
+    def closeEvent(self, event):
+        """Clean shutdown: keep or drop the autosave snapshot.
+
+        The autosave exists purely for crash protection.  If the user
+        answers the "Unsaved Session" dialog without cancelling, they
+        made a conscious decision about the current state (saved, or
+        deliberately discarded), so the recovery snapshot is removed
+        and the next start opens with a blank slate.  If the app
+        crashes instead, this code never runs and the last autosave
+        stays available for recovery.
+        """
+        if not self.maybe_save_session_on_close():
+            event.ignore()
+            return
+
+        self.discard_autosave()
+
+        super().closeEvent(event)
 
     # ------------------------------------------------------------------
 
@@ -5267,6 +5589,11 @@ def main():
     )
 
     window.show()
+
+    # Crash protection: if a previous run ended unexpectedly, the
+    # autosave from that session is still on disk — offer to reopen it
+    # so the user can continue where they left off.
+    window.maybe_restore_autosave_on_startup()
 
     sys.exit(
         app.exec()
