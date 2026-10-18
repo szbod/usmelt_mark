@@ -29,6 +29,7 @@ from PySide6.QtGui import (
     QAction,
     QColor,
     QFont,
+    QFontMetrics,
     QImage,
     QPainter,
     QPainterPath,
@@ -3237,14 +3238,16 @@ class ImageMarkerApp(QMainWindow):
         # --------------------------------------------------------------
         # Marker counter (bottom of the left task bar)
         #
-        # Shows how many "real" markers are currently placed in the
-        # session, i.e. all markers except the "Test" ones (the markers
-        # whose voltage is 5 V).  It is refreshed whenever markers are
-        # added / undone / cleared / loaded (update_marker_counter).
+        # Format: "Exposures: N (+M)" where N is the number of real
+        # (non-test) markers and M is the number of "Test" markers
+        # (voltage = 5 V).  The main part is rendered with an enlarged
+        # font so it stands out; the "(+M)" suffix stays small.
+        # It is refreshed whenever markers are added / undone /
+        # cleared / loaded (update_marker_counter).
         # --------------------------------------------------------------
 
         self.marker_counter_label = QLabel(
-            "Markers (non-test): 0"
+            self._marker_counter_html(0, 0)
         )
 
         self.marker_counter_label.setObjectName(
@@ -3253,6 +3256,12 @@ class ImageMarkerApp(QMainWindow):
 
         self.marker_counter_label.setAlignment(
             Qt.AlignCenter
+        )
+
+        # Rich text lets us enlarge only the important part while
+        # keeping the "(+M)" test-marker suffix visually subdued.
+        self.marker_counter_label.setTextFormat(
+            Qt.RichText
         )
 
         self.marker_counter_label.setStyleSheet(
@@ -3265,8 +3274,8 @@ class ImageMarkerApp(QMainWindow):
         )
 
         self.marker_counter_label.setToolTip(
-            "Number of markers currently placed in this session,\n"
-            "excluding \"Test\" markers (voltage = 5 V)."
+            "N = number of exposures (markers excluding \"Test\"\n"
+            "markers at 5 V).  (+M) = test markers placed."
         )
 
         left_layout.addWidget(
@@ -3376,14 +3385,51 @@ class ImageMarkerApp(QMainWindow):
 
     # ------------------------------------------------------------------
 
-    def update_marker_counter(self):
-        """Refresh the non-test marker counter in the left task bar.
+    @staticmethod
+    def _marker_counter_html(non_test, test_count):
+        """Build the counter's rich-text string.
 
-        "Test" markers (the ones placed at a voltage of 5 V) are not
-        counted; only the real sample markers are.  The label lives at
-        the bottom of the left-side tool bar and is updated in real
-        time whenever the marker list changes (add / undo / redo /
-        clear / new image / load session).
+        Layout:  "Exposures: N (+M)"
+
+        * ``N`` (real, non-test markers) is part of the main text and
+          is rendered with an enlarged font so it stands out from the
+          surrounding settings.
+        * ``(+M)`` (the "Test" markers at 5 V) is appended in a
+          smaller, subdued font; it is omitted entirely when there
+          are no test markers.
+        """
+        base_size = QFontMetrics(
+            QApplication.font()
+        ).height()
+
+        main_size = max(base_size + 6, int(base_size * 1.4))
+
+        html = (
+            f'<span style="font-size:{main_size}px;">'
+            f"Exposures: {non_test}"
+            f"</span>"
+        )
+
+        if test_count:
+            html += (
+                f' <span style="font-size:{base_size}px; '
+                f'color: palette(mid);">'
+                f"(+{test_count})"
+                f"</span>"
+            )
+
+        return html
+
+    def update_marker_counter(self):
+        """Refresh the exposure counter in the left task bar.
+
+        Shows "Exposures: N (+M)" where N counts the real markers and
+        M counts the "Test" markers (the ones placed at a voltage of
+        5 V).  Everything except "(+M)" uses an enlarged font so the
+        important number is easy to spot.  The label lives at the
+        bottom of the left-side tool bar and is updated in real time
+        whenever the marker list changes (add / undo / redo / clear /
+        new image / load session).
         """
         if not hasattr(self, "marker_counter_label"):
             return
@@ -3396,13 +3442,10 @@ class ImageMarkerApp(QMainWindow):
 
         test_count = total - non_test
 
-        text = f"Markers (non-test): {non_test}"
-
-        if test_count:
-            text += f"  ·  Test: {test_count}  ·  Total: {total}"
-
         self.marker_counter_label.setText(
-            text
+            self._marker_counter_html(
+                non_test, test_count
+            )
         )
 
     # ------------------------------------------------------------------
