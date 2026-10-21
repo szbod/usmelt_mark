@@ -56,12 +56,20 @@ class TG5012A:
     Based on the manual found at 
     https://resources.aimtti.com/manuals/TG5012A_2512A_5011A+2511A_Instructions-Iss8.pdf
     """
-    def __init__(self, serial_port = None, address='t539639.local', port=9221, auto_local=True, error_check=True):
+    def __init__(self, serial_port = None, address='t539639.local', port=9221, auto_local=None, error_check=None):
         """Connects to a TF5012A function generator using the given serial_port or LAN address and port
-        
-        If auto_local is true (default), the instrument will be set to local mode after each command.
-        if error_check is true (default), the instrument will check for errors after each command.
+
+        If auto_local is true, the instrument will be set to local mode after each command.
+        if error_check is true, the instrument will query the error registers after each command.
+        Each extra round-trip costs ~10-40 ms on USB-serial, so leaving either enabled makes a
+        melt (which sends 10-20 commands per channel) noticeably slower.  Both default to the
+        fastest safe setting now (auto_local=False, error_check=False); pass them explicitly to
+        restore the old behavior.
         """
+        if auto_local is None:
+            auto_local = False
+        if error_check is None:
+            error_check = False
         self.terminator = b'\n'
         self.ser = None
         self.sock = None
