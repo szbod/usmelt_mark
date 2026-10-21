@@ -2407,9 +2407,15 @@ class MelterPanel(QGroupBox):
                         / "short-laser-sfx.wav"
                     )
 
+                    # Play asynchronously (SND_ASYNC) so the ~1 s wav
+                    # file does NOT block the thread.  Previously this
+                    # call blocked until the sound finished, delaying
+                    # the *TRG command -- and therefore the actual
+                    # output pulse -- by the full length of the clip.
                     winsound.PlaySound(
                         str(sound_effect_path),
-                        winsound.SND_FILENAME,
+                        winsound.SND_FILENAME
+                        | winsound.SND_ASYNC,
                     )
 
                 self.pg.channel(1)
