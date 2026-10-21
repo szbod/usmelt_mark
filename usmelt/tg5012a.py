@@ -1,5 +1,6 @@
 
 
+import atexit
 import socket
 import serial
 import logging
@@ -16,6 +17,37 @@ formatter = logging.Formatter('%(asctime)s - %(message)s')
 handler.setFormatter(formatter)
 pg_logger.addHandler(handler)
 pg_logger.propagate = False
+
+try:
+    from serial.serialutil import SerialException
+except ImportError:  # pyserial not installed
+    class SerialException(Exception):
+        pass
+
+
+class SerialOpenError(ConnectionError):
+    """Raised when a COM/serial port cannot be opened.
+
+    Gives the user an actionable message instead of the raw pyserial
+    traceback, e.g. the Windows "PermissionError(13, 'Access is
+    denied.')" that happens when a previous run (or another program)
+    still holds the port open.
+    """
+    def __init__(self, original_exception, port=None):
+        self.original_exception = original_exception
+        self.port = port
+        message = "Could not open serial port %r: %s" % (port, original_exception)
+        if isinstance(original_exception, PermissionError) or \
+                type(original_exception).__name__ == 'SerialException':
+            message += (
+                "\nThe port is busy or access is denied. This usually means "
+                "another program -- or a previous instance of this program "
+                "that did not shut down cleanly -- still has the port open. "
+                "Close any other application using the port (including stray "
+                "python.exe processes in Task Manager), or unplug and replug "
+                "the USB cable, then try again."
+            )
+        super().__init__(message)
 
 class TG5012A:
     """
@@ -35,10 +67,21 @@ class TG5012A:
         self.sock = None
         self.auto_local = auto_local
         self.error_check = error_check
+        self._closed = False
+        # Safety net: make sure the connection is released when this
+        # process exits, even if the program is killed or forgets to
+        # call close().  Leaving a COM port open at exit is what causes
+        # "could not open port ... PermissionError(13, 'Access is
+        # denied.')" on Windows the next time the program runs.
+        atexit.register(self.close)
         if serial_port is not None:
-            # Prefer serial over LAN communication        
-            ser = serial.Serial(port = serial_port)
+            # Prefer serial over LAN communication
+            try:
+                ser = serial.Serial(port = serial_port)
+            except serial.SerialException as e:
+                raise SerialOpenError(e, port=serial_port)
             if(ser.is_open != True):
+                ser.close()
                 raise ConnectionError("Serial port failed to open")
             try:
                 self.ser = ser
@@ -50,20 +93,45 @@ class TG5012A:
         else:
             # Open LAN connection
             self.sock = socket.socket()
-            self.sock.connect((address, port))
+            try:
+                self.sock.connect((address, port))
+            except OSError:
+                self.sock.close()
+                self.sock = None
+                raise
             try:
                 pg_logger.info(self.id())
                 pg_logger.info("Successfully connected to TG5012A on %s:%d" % (address, port))
             except:
                 self.sock.close()
                 raise
-        
+
     def close(self):
-        """Close the serial connection."""
-        self.ser.close()
+        """Close the serial (or LAN) connection and release the port."""
+        if self.ser is not None:
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+        self._closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+        return False
 
     def reopen(self):
         """Reopen the serial connection."""
+        if self.ser is None:
+            raise ConnectionError("No serial connection was ever opened on this object; create a new TG5012A instance instead")
+        self._closed = False
         self.ser.open()
         if(self.ser.is_open != True):
             raise ConnectionError("Serial port failed to open")

@@ -3,6 +3,7 @@ import sys
 import json
 import math
 import copy
+import atexit
 import argparse
 import configparser
 from datetime import datetime
@@ -1344,7 +1345,19 @@ class MelterPanel(QGroupBox):
         else:
             # IMPORTANT:
             # Use the original USMELT discovery and initialization path.
-            self.find_and_init_pg()
+            try:
+                self.find_and_init_pg()
+            except Exception as exc:
+                # The port may be busy (e.g. a previous run of this
+                # program did not shut down cleanly) or simply absent.
+                # Report it instead of crashing with a raw traceback;
+                # the user can still connect later via "Set Device".
+                self.pg = None
+                QMessageBox.critical(
+                    self,
+                    "Device Error",
+                    f"Could not connect to the pulse generator: {exc}",
+                )
 
         self.update_channel_states()
 
@@ -2721,6 +2734,11 @@ class MelterPanel(QGroupBox):
 
         self.device_name = new_device
 
+        # Release the previous connection (if any) *before* opening a
+        # new one; otherwise the old COM port handle stays open and
+        # Windows reports "Access is denied" the next time it is used.
+        self.close_pg()
+
         try:
             self.pg = usmelt.TG5012A(
                 serial_port=self.device_name
@@ -2736,6 +2754,18 @@ class MelterPanel(QGroupBox):
             )
 
             self.pg = None
+
+    # ------------------------------------------------------------------
+
+    def close_pg(self):
+        """Close the pulse generator connection and release the port."""
+        pg = getattr(self, "pg", None)
+        if pg is not None:
+            try:
+                pg.close()
+            except Exception:
+                pass
+        self.pg = None
 
 
 # ----------------------------------------------------------------------
@@ -4710,6 +4740,15 @@ class ImageMarkerApp(QMainWindow):
 
         self.discard_autosave()
 
+        # Release the pulse generator's serial port so the next run of
+        # the program can open it again (an orphaned COM handle on
+        # Windows blocks re-opening until the process dies or the PC is
+        # restarted).
+        try:
+            self.melter.close_pg()
+        except Exception:
+            pass
+
         super().closeEvent(event)
 
     # ------------------------------------------------------------------
@@ -5589,6 +5628,14 @@ def main():
     )
 
     window.show()
+
+    # Make absolutely sure the pulse generator's serial port gets
+    # released when this process ends -- even if the app is killed or
+    # crashes before closeEvent() runs.  On Windows, a lingering open
+    # handle on COM6 causes "PermissionError(13, 'Access is denied.')"
+    # the next time the program is started (sometimes only fixable by
+    # a reboot).
+    atexit.register(window.melter.close_pg)
 
     # Crash protection: if a previous run ended unexpectedly, the
     # autosave from that session is still on disk — offer to reopen it
