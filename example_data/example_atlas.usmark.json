@@ -3,7 +3,7 @@
   "version": 1,
   "saved_at": "2026-10-29T14:41:32",
   "image": {
-    "path": "C:/Users/szabb/Documents/Software/usmelt_mark/example_data/example_atlas.png",
+    "path": "./example_data/example_atlas.png",
     "crop_offset_x": 2002,
     "crop_offset_y": 2002
   },
