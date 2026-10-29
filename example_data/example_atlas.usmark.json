@@ -1,0 +1,168 @@
+{
+  "app": "usmark_gui",
+  "version": 1,
+  "saved_at": "2026-10-29T14:41:32",
+  "image": {
+    "path": "C:/Users/szabb/Documents/Software/usmelt_mark/example_data/example_atlas.png",
+    "crop_offset_x": 2002,
+    "crop_offset_y": 2002
+  },
+  "toolbar": {
+    "rotation": -25.0,
+    "marker_size": 40,
+    "color_min": 1.0,
+    "color_max": 1.5,
+    "current_shape": "square",
+    "shape_labels": {
+      "circle": "circle",
+      "triangle": "triangle",
+      "square": "square",
+      "star": ""
+    }
+  },
+  "markers": [
+    {
+      "x": 1540.829234522753,
+      "y": 371.4375364502032,
+      "size": 40,
+      "voltage": 5.0,
+      "is_test": true,
+      "shape": "circle",
+      "last": false
+    },
+    {
+      "x": 1655.5610884443036,
+      "y": 477.2027128298348,
+      "size": 40,
+      "voltage": 5.0,
+      "is_test": true,
+      "shape": "circle",
+      "last": false
+    },
+    {
+      "x": 901.9284570203383,
+      "y": 1549.4029083152725,
+      "size": 40,
+      "voltage": 1.0,
+      "is_test": false,
+      "shape": "circle",
+      "last": false
+    },
+    {
+      "x": 1027.600909781572,
+      "y": 1441.020474408376,
+      "size": 40,
+      "voltage": 1.0,
+      "is_test": false,
+      "shape": "circle",
+      "last": false
+    },
+    {
+      "x": 1132.587486852251,
+      "y": 1344.5984897361782,
+      "size": 40,
+      "voltage": 1.0,
+      "is_test": false,
+      "shape": "circle",
+      "last": false
+    },
+    {
+      "x": 1014.2843045006865,
+      "y": 1667.9071332385558,
+      "size": 40,
+      "voltage": 1.2,
+      "is_test": false,
+      "shape": "circle",
+      "last": false
+    },
+    {
+      "x": 1113.7000608656645,
+      "y": 1573.0825556986074,
+      "size": 40,
+      "voltage": 1.2,
+      "is_test": false,
+      "shape": "circle",
+      "last": false
+    },
+    {
+      "x": 1248.138148597098,
+      "y": 1474.2443560708637,
+      "size": 40,
+      "voltage": 1.2,
+      "is_test": false,
+      "shape": "triangle",
+      "last": false
+    },
+    {
+      "x": 1383.3548356374845,
+      "y": 1357.0962871937672,
+      "size": 40,
+      "voltage": 1.2,
+      "is_test": false,
+      "shape": "triangle",
+      "last": false
+    },
+    {
+      "x": 2217.3256883096215,
+      "y": 1889.6543315793165,
+      "size": 40,
+      "voltage": 1.4,
+      "is_test": false,
+      "shape": "triangle",
+      "last": false
+    },
+    {
+      "x": 2211.9559101756386,
+      "y": 2102.204534733595,
+      "size": 40,
+      "voltage": 1.4,
+      "is_test": false,
+      "shape": "triangle",
+      "last": false
+    },
+    {
+      "x": 2192.2496763657555,
+      "y": 2306.807910740971,
+      "size": 40,
+      "voltage": 1.4,
+      "is_test": false,
+      "shape": "triangle",
+      "last": false
+    },
+    {
+      "x": 1180.9952378082526,
+      "y": 2343.228789579708,
+      "size": 40,
+      "voltage": 1.5,
+      "is_test": false,
+      "shape": "square",
+      "last": false
+    },
+    {
+      "x": 1282.1860809109858,
+      "y": 2476.7301428751334,
+      "size": 40,
+      "voltage": 1.5,
+      "is_test": false,
+      "shape": "square",
+      "last": false
+    },
+    {
+      "x": 1384.0539668910696,
+      "y": 2594.309870736339,
+      "size": 40,
+      "voltage": 1.5,
+      "is_test": false,
+      "shape": "square",
+      "last": true
+    }
+  ],
+  "melter": {
+    "use_shaping": false,
+    "shaping_v1": 1.05,
+    "shaping_t1": 20.0,
+    "shaping_v2": 1.1,
+    "shaping_t2": 45.0,
+    "melt_sound": true
+  }
+}
