@@ -1660,6 +1660,9 @@ class MelterPanel(QGroupBox):
         """
         Original TG5012A initialization.
         """
+        # Clear any error/status flags left by a previous (possibly force-killed)
+        # session so the device doesn't beep on reconnect.
+        self.pg.clear_status()
 
         # --- Channel 1 settings ---
         self.pg.channel(1)

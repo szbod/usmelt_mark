@@ -85,7 +85,7 @@ class TG5012A:
         if serial_port is not None:
             # Prefer serial over LAN communication
             try:
-                ser = serial.Serial(port = serial_port)
+                ser = serial.Serial(port=serial_port, timeout=5, write_timeout=5)
             except serial.SerialException as e:
                 raise SerialOpenError(e, port=serial_port)
             if(ser.is_open != True):
@@ -526,6 +526,13 @@ class TG5012A:
             recv = self.sock.recv(1024)
             return recv.decode('ascii').strip()
         elif self.ser:
-            return self.ser.readline().decode('ascii').strip()
+            raw = self.ser.readline()
+            if not raw:
+                raise ConnectionError(
+                    "Read timeout: no response from TG5012A on %s. "
+                    "Check that the device is powered on and the cable is connected."
+                    % self.ser.port
+                )
+            return raw.decode('ascii').strip()
         else:
             raise ConnectionError("No connection to instrument")
