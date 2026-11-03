@@ -1660,8 +1660,11 @@ class MelterPanel(QGroupBox):
         """
         Original TG5012A initialization.
         """
-        # Clear any error/status flags left by a previous (possibly force-killed)
-        # session so the device doesn't beep on reconnect.
+        # Full instrument reset first: clears any waveform state, active outputs,
+        # or trigger modes left by a previous (possibly force-killed) session.
+        # *RST resets everything to factory defaults; *CLS then clears the
+        # status/error registers so the device doesn't beep on reconnect.
+        self.pg.reset()
         self.pg.clear_status()
 
         # --- Channel 1 settings ---
@@ -4133,7 +4136,7 @@ class ImageMarkerApp(QMainWindow):
             self,
             "Open Image",
             "",
-            "Images (*.jpg *.jpeg *.png)",
+            "Images (*.jpg *.jpeg *.png *.tif *.tiff)",
         )
 
         if not file_name:
@@ -4777,7 +4780,7 @@ class ImageMarkerApp(QMainWindow):
                 self,
                 "Export Annotated Image",
                 "",
-                "PNG (*.png);;JPEG (*.jpg *.jpeg)",
+                "PNG (*.png);;JPEG (*.jpg *.jpeg);;TIFF (*.tif *.tiff)",
             )
         )
 
