@@ -28,6 +28,7 @@ except ImportError:  # allow headless testing of the pure-Python parts
 from PySide6.QtCore import Qt, QRectF, QPoint, QPointF, Signal
 from PySide6.QtGui import (
     QAction,
+    QBrush,
     QColor,
     QFont,
     QFontMetrics,
@@ -500,6 +501,20 @@ class ImageCanvas(QWidget):
         self.middle_dragging = False
         self.last_mouse_pos = QPoint()
 
+        # --- Guide mesh state ----------------------------------------
+        # All parameters live in base-image pixel coordinates so that
+        # the mesh follows image zoom/pan/rotation automatically.
+        self.guide_spacing   = 100.0  # px between adjacent nodes
+        self.guide_angle     = 0.0    # mesh rotation (degrees)
+        self.guide_offset_x  = 0.0   # mesh origin x (base-image px)
+        self.guide_offset_y  = 0.0   # mesh origin y (base-image px)
+        # "off"         – mesh hidden, normal image nav
+        # "calibrating" – user clicks 3 points to define the mesh
+        # "preview"     – mesh calculated from clicks; awaiting accept/retry
+        # "applied"     – mesh locked; image nav restored, snapping active
+        self.guide_mode         = "off"
+        self.guide_calib_points = []  # list of (bx, by) base-image tuples
+
     # ------------------------------------------------------------------
 
     def set_image(self, image, image_path=None):
@@ -523,6 +538,292 @@ class ImageCanvas(QWidget):
     def set_rotation(self, angle):
         self.rotation = float(angle)
         self.render_image()
+
+    # ------------------------------------------------------------------
+
+    def set_guide_mode(self, mode):
+        """Set guide mode: 'off', 'calibrating', 'preview', or 'applied'."""
+        assert mode in ("off", "calibrating", "preview", "applied")
+        if mode == "calibrating":
+            self.guide_calib_points = []
+            self.setCursor(Qt.CrossCursor)
+        else:
+            self.setCursor(Qt.ArrowCursor)
+        self.guide_mode = mode
+        self.update()
+
+    def set_guide_angle(self, angle):
+        """Set the mesh rotation angle in degrees and repaint."""
+        self.guide_angle = float(angle)
+        self.update()
+
+    def set_guide_spacing(self, spacing):
+        """Set the mesh node spacing (base-image pixels) and repaint."""
+        self.guide_spacing = max(5.0, float(spacing))
+        self.update()
+
+    # ------------------------------------------------------------------
+
+    def _calculate_guide_from_points(self, p1, p2, pn):
+        """Compute mesh parameters from three calibration points.
+
+        p1 = S1, p2 = S2 (adjacent square, same row),
+        pn = Sn (a farther square in the same row).
+        All coordinates are base-image pixels.
+
+        Strategy: the long S1→Sn baseline is used for both the angle
+        and the final spacing so that S1 and Sn land exactly on nodes.
+        S2 is used only to estimate the integer number of intervals
+        between S1 and Sn (so a slightly mis-clicked S2 cannot skew
+        the spacing across the whole field).
+
+        Returns (spacing, angle_deg, offset_x, offset_y) or None when
+        the points are too close together to yield a useful mesh.
+        """
+        # Long baseline S1 → Sn.
+        dx1n = pn[0] - p1[0]
+        dy1n = pn[1] - p1[1]
+        dist1n = math.sqrt(dx1n * dx1n + dy1n * dy1n)
+
+        # Short step S1 → S2 (one square width, roughly).
+        dx12 = p2[0] - p1[0]
+        dy12 = p2[1] - p1[1]
+        dist12 = math.sqrt(dx12 * dx12 + dy12 * dy12)
+
+        if dist12 < 2.0 or dist1n < dist12 * 0.5:
+            return None
+
+        # Project S1→S2 onto the S1→Sn unit vector so that any
+        # perpendicular click error in S2 does not inflate the estimate.
+        ux = dx1n / dist1n
+        uy = dy1n / dist1n
+        dist12_along_axis = abs(dx12 * ux + dy12 * uy)
+        if dist12_along_axis < 2.0:
+            return None
+
+        # Number of intervals from S1 to Sn, rounded to nearest integer.
+        n = max(1, round(dist1n / dist12_along_axis))
+
+        # Angle from long baseline — far more accurate than S1→S2 alone.
+        angle_deg = math.degrees(math.atan2(dy1n, dx1n))
+
+        # Spacing: divide long baseline by n.
+        # This guarantees S1 (offset) and Sn are exact mesh nodes,
+        # so the alignment error cannot accumulate across the field.
+        spacing = dist1n / n
+
+        if spacing < 2.0:
+            return None
+
+        # Mesh origin: S1 is node (0, 0).
+        return spacing, angle_deg, p1[0], p1[1]
+
+    # ------------------------------------------------------------------
+
+    def _base_to_widget(self, bx, by):
+        """Convert base-image coordinates to widget (screen) coordinates."""
+        if self.base_image is None or self.display_image is None:
+            return None
+        rw = self.display_image.width
+        rh = self.display_image.height
+        if self.display_rect.width() <= 0 or self.display_rect.height() <= 0:
+            return None
+        cx_base = self.base_image.width  / 2.0
+        cy_base = self.base_image.height / 2.0
+        cx_rot  = rw / 2.0
+        cy_rot  = rh / 2.0
+        dx = bx - cx_base
+        dy = by - cy_base
+        # Inverse of rotated_to_base_image (rotate by −θ in base space).
+        theta = math.radians(self.rotation)
+        cos_t = math.cos(theta)
+        sin_t = math.sin(theta)
+        rx = dx * cos_t + dy * sin_t + cx_rot
+        ry = -dx * sin_t + dy * cos_t + cy_rot
+        wx = self.display_rect.left() + rx * self.display_rect.width()  / rw
+        wy = self.display_rect.top()  + ry * self.display_rect.height() / rh
+        return wx, wy
+
+    def _widget_delta_to_base(self, dwx, dwy):
+        """Convert a screen-space translation to a base-image translation."""
+        if self.display_image is None or self.display_rect.width() <= 0:
+            return 0.0, 0.0
+        rw = self.display_image.width
+        rh = self.display_image.height
+        drx = dwx * rw / self.display_rect.width()
+        dry = dwy * rh / self.display_rect.height()
+        theta = math.radians(self.rotation)
+        cos_t = math.cos(theta)
+        sin_t = math.sin(theta)
+        dbx = drx * cos_t - dry * sin_t
+        dby = drx * sin_t + dry * cos_t
+        return dbx, dby
+
+    # ------------------------------------------------------------------
+
+    def snap_to_guide(self, bx, by):
+        """Return the nearest mesh node to base-image point (bx, by)."""
+        s = self.guide_spacing
+        if s < 1:
+            return bx, by
+        cos_a = math.cos(math.radians(self.guide_angle))
+        sin_a = math.sin(math.radians(self.guide_angle))
+        dx = bx - self.guide_offset_x
+        dy = by - self.guide_offset_y
+        fi = (dx * cos_a + dy * sin_a) / s
+        fj = (-dx * sin_a + dy * cos_a) / s
+        i  = round(fi)
+        j  = round(fj)
+        nx = self.guide_offset_x + i * s * cos_a - j * s * sin_a
+        ny = self.guide_offset_y + i * s * sin_a + j * s * cos_a
+        return nx, ny
+
+    # ------------------------------------------------------------------
+
+    def _draw_guide_overlay(self, painter):
+        """Draw the guide mesh overlay on the widget."""
+        if self.guide_mode == "off" or self.base_image is None:
+            return
+        if self.display_pixmap.isNull() or self.display_image is None:
+            return
+        if self.display_rect.width() <= 0:
+            return
+
+        painter.setRenderHint(QPainter.Antialiasing, True)
+
+        # ── Calibrating: show collected points and instruction HUD ──────
+        if self.guide_mode == "calibrating":
+            pt_colors = [
+                QColor(50,  220, 100),   # S1 — green
+                QColor(255, 200,  50),   # S2 — yellow
+                QColor(255, 120,  50),   # Sn — orange
+            ]
+            pt_labels = ["S1", "S2", "Sn"]
+            instructions = [
+                "Click S1 — centre of any grid square",
+                "Click S2 — centre of the adjacent grid square (same row)",
+                "Click Sn — centre of a far grid square in the same row",
+            ]
+
+            mono_font = painter.font()
+            mono_font.setFamily("Monospace")
+            mono_font.setPointSize(10)
+            mono_font.setBold(True)
+
+            for idx, pt_base in enumerate(self.guide_calib_points):
+                pt_w = self._base_to_widget(*pt_base)
+                if pt_w is None:
+                    continue
+                color = pt_colors[idx]
+                # Dot
+                painter.setPen(QPen(QColor(0, 0, 0, 180), 1.5))
+                painter.setBrush(QBrush(color))
+                painter.drawEllipse(QPointF(*pt_w), 6.0, 6.0)
+                # Label
+                painter.setFont(mono_font)
+                painter.setPen(QPen(color))
+                painter.drawText(
+                    QPointF(pt_w[0] + 10, pt_w[1] - 6), pt_labels[idx]
+                )
+
+            n_placed = len(self.guide_calib_points)
+            hud_text = (
+                instructions[n_placed]
+                if n_placed < 3
+                else "Calculating…"
+            )
+            hud_font = painter.font()
+            hud_font.setFamily("Monospace")
+            hud_font.setPointSize(9)
+            hud_font.setBold(False)
+            painter.setFont(hud_font)
+            painter.setPen(QColor(50, 220, 100, 230))
+            painter.drawText(8, self.height() - 8, hud_text)
+            return
+
+        # ── Shared mesh geometry (preview + applied) ────────────────────
+        s     = self.guide_spacing
+        cos_a = math.cos(math.radians(self.guide_angle))
+        sin_a = math.sin(math.radians(self.guide_angle))
+        W     = float(self.base_image.width)
+        H     = float(self.base_image.height)
+
+        corners_base = [(0.0, 0.0), (W, 0.0), (W, H), (0.0, H)]
+        fi_list, fj_list = [], []
+        for cbx, cby in corners_base:
+            dx = cbx - self.guide_offset_x
+            dy = cby - self.guide_offset_y
+            fi_list.append(( dx * cos_a + dy * sin_a) / s)
+            fj_list.append((-dx * sin_a + dy * cos_a) / s)
+
+        i_min = math.floor(min(fi_list)) - 1
+        i_max = math.ceil(max(fi_list))  + 1
+        j_min = math.floor(min(fj_list)) - 1
+        j_max = math.ceil(max(fj_list))  + 1
+
+        def node_w(ni, nj):
+            nbx = self.guide_offset_x + ni * s * cos_a - nj * s * sin_a
+            nby = self.guide_offset_y + ni * s * sin_a + nj * s * cos_a
+            return self._base_to_widget(nbx, nby)
+
+        wrect = self.rect()
+
+        # ── Preview: lines + dots + HUD ─────────────────────────────────
+        if self.guide_mode == "preview":
+            line_color = QColor(255, 210, 50, 200)
+            node_color = QColor(255, 210, 50, 240)
+
+            pen = QPen(line_color, 1.2, Qt.SolidLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+
+            for j in range(j_min, j_max + 1):
+                p1 = node_w(i_min, j)
+                p2 = node_w(i_max, j)
+                if p1 and p2:
+                    painter.drawLine(QPointF(*p1), QPointF(*p2))
+
+            for i in range(i_min, i_max + 1):
+                p1 = node_w(i, j_min)
+                p2 = node_w(i, j_max)
+                if p1 and p2:
+                    painter.drawLine(QPointF(*p1), QPointF(*p2))
+
+            n_nodes = (i_max - i_min + 1) * (j_max - j_min + 1)
+            if n_nodes <= 2500:
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(node_color))
+                for ni in range(i_min, i_max + 1):
+                    for nj in range(j_min, j_max + 1):
+                        pt = node_w(ni, nj)
+                        if pt and wrect.contains(int(pt[0]), int(pt[1])):
+                            painter.drawEllipse(QPointF(*pt), 3.5, 3.5)
+
+            hud_font = painter.font()
+            hud_font.setFamily("Monospace")
+            hud_font.setPointSize(9)
+            painter.setFont(hud_font)
+            painter.setPen(QColor(255, 210, 50, 230))
+            painter.drawText(
+                8, self.height() - 8,
+                f"spacing: {s:.0f} px   angle: {self.guide_angle:.1f}°"
+                "   → Accept Guide or Retry",
+            )
+            return
+
+        # ── Applied: subtle dots only (no lines) ────────────────────────
+        if self.guide_mode == "applied":
+            node_color = QColor(80, 180, 255, 110)
+            n_nodes = (i_max - i_min + 1) * (j_max - j_min + 1)
+            if n_nodes > 4000:
+                return  # too many to draw without lag
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(node_color))
+            for ni in range(i_min, i_max + 1):
+                for nj in range(j_min, j_max + 1):
+                    pt = node_w(ni, nj)
+                    if pt and wrect.contains(int(pt[0]), int(pt[1])):
+                        painter.drawEllipse(QPointF(*pt), 2.0, 2.0)
 
     # ------------------------------------------------------------------
 
@@ -755,6 +1056,8 @@ class ImageCanvas(QWidget):
             source_rect,
         )
 
+        self._draw_guide_overlay(painter)
+
         # ------------------------------------------------------------------
         # "Last placed marker" highlight (GUI-only overlay).
         #
@@ -906,6 +1209,9 @@ class ImageCanvas(QWidget):
 
         bx, by = base
 
+        if self.guide_mode == "applied":
+            bx, by = self.snap_to_guide(bx, by)
+
         if (
             self.base_image is not None
             and 0 <= bx < self.base_image.width
@@ -919,6 +1225,44 @@ class ImageCanvas(QWidget):
     # ------------------------------------------------------------------
 
     def mousePressEvent(self, event):
+        # Calibrating mode: left-click collects calibration points.
+        # Middle-click still pans so the user can navigate between
+        # widely-spaced grid squares.  Markers are never placed here.
+        if self.guide_mode == "calibrating":
+            if event.button() == Qt.LeftButton:
+                rotated = self.widget_to_rotated_image(
+                    event.position().toPoint()
+                )
+                if rotated is not None:
+                    base = self.rotated_to_base_image(*rotated)
+                    if base is not None:
+                        self.guide_calib_points.append(base)
+                        if len(self.guide_calib_points) == 3:
+                            result = self._calculate_guide_from_points(
+                                self.guide_calib_points[0],
+                                self.guide_calib_points[1],
+                                self.guide_calib_points[2],
+                            )
+                            if result is not None:
+                                (self.guide_spacing,
+                                 self.guide_angle,
+                                 self.guide_offset_x,
+                                 self.guide_offset_y) = result
+                                self.guide_mode = "preview"
+                                self.setCursor(Qt.ArrowCursor)
+                                if self.app is not None:
+                                    self.app._update_guide_ui()
+                            else:
+                                # Degenerate points — start over.
+                                self.guide_calib_points = []
+                        self.update()
+                return  # never place a marker in calibrating mode
+            if event.button() == Qt.MiddleButton:
+                self.middle_dragging = True
+                self.last_mouse_pos = event.position().toPoint()
+                self.setCursor(Qt.ClosedHandCursor)
+            return  # suppress right-click in calibrating mode
+
         if event.button() == Qt.MiddleButton:
             self.middle_dragging = True
             self.last_mouse_pos = event.position().toPoint()
@@ -955,7 +1299,11 @@ class ImageCanvas(QWidget):
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MiddleButton:
             self.middle_dragging = False
-            self.setCursor(Qt.ArrowCursor)
+            self.setCursor(
+                Qt.CrossCursor
+                if self.guide_mode == "calibrating"
+                else Qt.ArrowCursor
+            )
 
     # ------------------------------------------------------------------
 
@@ -3549,12 +3897,12 @@ class ImageMarkerApp(QMainWindow):
         # Rotation
         # --------------------------------------------------------------
 
-        rotation_group = QGroupBox(
+        self.rotation_group = QGroupBox(
             "Rotation"
         )
 
         rotation_layout = QGridLayout(
-            rotation_group
+            self.rotation_group
         )
 
         self.rotation_spin = QDoubleSpinBox()
@@ -3592,16 +3940,16 @@ class ImageMarkerApp(QMainWindow):
             1,
         )
 
-        reset_rotation_button = QPushButton(
+        self.reset_rotation_button = QPushButton(
             "Reset Rotation"
         )
 
-        reset_rotation_button.clicked.connect(
+        self.reset_rotation_button.clicked.connect(
             self.reset_rotation
         )
 
         rotation_layout.addWidget(
-            reset_rotation_button,
+            self.reset_rotation_button,
             1,
             0,
             1,
@@ -3609,8 +3957,42 @@ class ImageMarkerApp(QMainWindow):
         )
 
         marker_layout.addWidget(
-            rotation_group
+            self.rotation_group
         )
+
+        # --------------------------------------------------------------
+        # Guide (snap-to-mesh)
+        # --------------------------------------------------------------
+
+        guide_group = QGroupBox("Guide")
+        guide_layout = QVBoxLayout(guide_group)
+
+        self.guide_toggle_button = QPushButton("Enable Guide")
+        self.guide_toggle_button.setToolTip(
+            "Start 3-point mesh calibration (click S1 → S2 → Sn).\n"
+            "Disable: remove guide and restore normal image navigation."
+        )
+        self.guide_toggle_button.clicked.connect(self.toggle_guide)
+        guide_layout.addWidget(self.guide_toggle_button)
+
+        self.guide_apply_button = QPushButton("Accept Guide")
+        self.guide_apply_button.setToolTip(
+            "Lock the calculated mesh in place.\n"
+            "While applied, markers snap to the nearest mesh node."
+        )
+        self.guide_apply_button.setEnabled(False)
+        self.guide_apply_button.clicked.connect(self.accept_guide)
+        guide_layout.addWidget(self.guide_apply_button)
+
+        self.guide_retry_button = QPushButton("Retry")
+        self.guide_retry_button.setToolTip(
+            "Discard the calculated mesh and pick three new points."
+        )
+        self.guide_retry_button.setVisible(False)
+        self.guide_retry_button.clicked.connect(self.retry_guide)
+        guide_layout.addWidget(self.guide_retry_button)
+
+        marker_layout.addWidget(guide_group)
 
         # --------------------------------------------------------------
         # Undo / Redo / Clear
@@ -3870,6 +4252,49 @@ class ImageMarkerApp(QMainWindow):
 
         return html
 
+    # ------------------------------------------------------------------
+    # Guide mesh controls
+    # ------------------------------------------------------------------
+
+    def toggle_guide(self):
+        """Enable (start calibration) or disable the guide."""
+        if self.canvas.guide_mode == "off":
+            self.canvas.set_guide_mode("calibrating")
+        else:
+            self.canvas.set_guide_mode("off")
+        self._update_guide_ui()
+        self._mark_session_dirty()
+
+    def accept_guide(self):
+        """Lock the calculated mesh (preview → applied)."""
+        if self.canvas.guide_mode != "preview":
+            return
+        self.canvas.set_guide_mode("applied")
+        self._update_guide_ui()
+        self._mark_session_dirty()
+
+    def retry_guide(self):
+        """Discard calculated mesh and restart calibration."""
+        if self.canvas.guide_mode != "preview":
+            return
+        self.canvas.set_guide_mode("calibrating")
+        self._update_guide_ui()
+
+    def _update_guide_ui(self):
+        """Refresh button states based on current guide mode."""
+        mode = self.canvas.guide_mode
+        self.guide_toggle_button.setText(
+            "Enable Guide" if mode == "off" else "Disable Guide"
+        )
+        if mode == "preview":
+            self.guide_apply_button.setEnabled(True)
+            self.guide_retry_button.setVisible(True)
+        else:
+            self.guide_apply_button.setEnabled(False)
+            self.guide_retry_button.setVisible(False)
+
+    # ------------------------------------------------------------------
+
     def update_marker_counter(self):
         """Refresh the exposure counter in the left task bar.
 
@@ -4106,28 +4531,15 @@ class ImageMarkerApp(QMainWindow):
     # ------------------------------------------------------------------
 
     def rotation_changed(self, value):
-        self.canvas.set_rotation(
-            value
-        )
+        self.canvas.set_rotation(value)
 
     # ------------------------------------------------------------------
 
     def reset_rotation(self):
-        self.rotation_spin.blockSignals(
-            True
-        )
-
-        self.rotation_spin.setValue(
-            0.0
-        )
-
-        self.rotation_spin.blockSignals(
-            False
-        )
-
-        self.canvas.set_rotation(
-            0.0
-        )
+        self.rotation_spin.blockSignals(True)
+        self.rotation_spin.setValue(0.0)
+        self.rotation_spin.blockSignals(False)
+        self.canvas.set_rotation(0.0)
 
     # ------------------------------------------------------------------
 
@@ -4305,6 +4717,13 @@ class ImageMarkerApp(QMainWindow):
                 "shape_labels": shape_labels,
             },
             "markers": marker_list_to_dicts(self.markers),
+            "guide": {
+                "spacing": float(self.canvas.guide_spacing),
+                "angle": float(self.canvas.guide_angle),
+                "offset_x": float(self.canvas.guide_offset_x),
+                "offset_y": float(self.canvas.guide_offset_y),
+                "applied": self.canvas.guide_mode == "applied",
+            },
         }
 
         # USMELT panel parameters are optional extras; older readers
@@ -4420,6 +4839,32 @@ class ImageMarkerApp(QMainWindow):
         self.canvas.set_markers(self.markers)
 
         self.update_marker_counter()
+
+        # --- Guide mesh (optional; older sessions lack this block) --------
+        guide_data = data.get("guide")
+
+        if guide_data:
+            try:
+                self.canvas.guide_spacing = max(
+                    5.0, float(guide_data.get("spacing", 100.0)))
+                self.canvas.guide_angle = float(
+                    guide_data.get("angle", 0.0))
+                self.canvas.guide_offset_x = float(
+                    guide_data.get("offset_x", 0.0))
+                self.canvas.guide_offset_y = float(
+                    guide_data.get("offset_y", 0.0))
+
+                if guide_data.get("applied"):
+                    # Restore to applied state without re-triggering the
+                    # calibration flow; _update_guide_ui will sync buttons.
+                    self.canvas.guide_mode = "applied"
+                    self._update_guide_ui()
+                    self.canvas.update()
+            except (TypeError, ValueError):
+                notes.append(
+                    "Guide mesh parameters in the session were invalid; "
+                    "using defaults."
+                )
 
         # --- Optional USMELT parameters --------------------------------
         melter_data = data.get("melter")
