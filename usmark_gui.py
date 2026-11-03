@@ -4056,12 +4056,8 @@ class ImageMarkerApp(QMainWindow):
             export_button
         )
 
-        left_layout.addWidget(
-            marker_group
-        )
-
         # --------------------------------------------------------------
-        # Marker counter (bottom of the left task bar)
+        # Marker counter (above Image Marking group)
         #
         # Format: "Exposures: N (+M)" where N is the number of real
         # (non-test) markers and M is the number of "Test" markers
@@ -4105,6 +4101,10 @@ class ImageMarkerApp(QMainWindow):
 
         left_layout.addWidget(
             self.marker_counter_label
+        )
+
+        left_layout.addWidget(
+            marker_group
         )
 
         # ==============================================================
