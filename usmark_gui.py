@@ -6004,7 +6004,6 @@ class ImageMarkerApp(QMainWindow):
                         cy
                         - total_h / 2.0
                         + line_index * line_h
-                        - (bbox[3] - bbox[1]) / 2.0
                         - bbox[1],
                     ),
                     line,
