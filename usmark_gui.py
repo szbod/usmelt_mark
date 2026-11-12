@@ -74,7 +74,7 @@ import usmelt
 # Marker data
 # ----------------------------------------------------------------------
 
-MARKER_SHAPES = ("circle", "triangle", "square", "star")
+MARKER_SHAPES = ("circle", "triangle", "square", "star", "diamond", "hexagon")
 
 
 def wrap_text_to_width(draw, text, font, max_width):
@@ -229,6 +229,26 @@ def draw_marker_shape(draw, shape, cx, cy, size, fill, outline=(0, 0, 0),
             ang = math.radians(-90.0 + k * 36.0)
             rad = r if k % 2 == 0 else inner
             pts.append((cx + rad * math.cos(ang), cy + rad * math.sin(ang)))
+        draw.polygon(pts, fill=fill, outline=outline, width=width)
+        return
+
+    if shape == "diamond":
+        # Four-point rhombus: top / right / bottom / left on the circle.
+        pts = [
+            (cx,       cy - r),
+            (cx + r,   cy),
+            (cx,       cy + r),
+            (cx - r,   cy),
+        ]
+        draw.polygon(pts, fill=fill, outline=outline, width=width)
+        return
+
+    if shape == "hexagon":
+        # Regular hexagon, flat-top orientation.
+        pts = []
+        for k in range(6):
+            ang = math.radians(k * 60.0)
+            pts.append((cx + r * math.cos(ang), cy + r * math.sin(ang)))
         draw.polygon(pts, fill=fill, outline=outline, width=width)
         return
 
@@ -453,6 +473,23 @@ class ShapeIconWidget(QWidget):
                 rad = r if k % 2 == 0 else inner
                 pts.append(QPointF(cx + rad * math.cos(ang),
                                    cy + rad * math.sin(ang)))
+            painter.drawPolygon(pts)
+
+        elif self.shape == "diamond":
+            pts = QPolygonF([
+                QPointF(cx,       cy - r),
+                QPointF(cx + r,   cy),
+                QPointF(cx,       cy + r),
+                QPointF(cx - r,   cy),
+            ])
+            painter.drawPolygon(pts)
+
+        elif self.shape == "hexagon":
+            pts = QPolygonF()
+            for k in range(6):
+                ang = math.radians(k * 60.0)
+                pts.append(QPointF(cx + r * math.cos(ang),
+                                   cy + r * math.sin(ang)))
             painter.drawPolygon(pts)
 
 
@@ -5972,6 +6009,33 @@ class ImageMarkerApp(QMainWindow):
                     )
                 od.polygon(
                     poly,
+                    fill=(120, 120, 120, 255),
+                    outline=(0, 0, 0, 255),
+                    width=1,
+                )
+
+            elif shape_name == "diamond":
+                od.polygon(
+                    [
+                        (icon_cx,            cy - icon_r),
+                        (icon_cx + icon_r,   cy),
+                        (icon_cx,            cy + icon_r),
+                        (icon_cx - icon_r,   cy),
+                    ],
+                    fill=(120, 120, 120, 255),
+                    outline=(0, 0, 0, 255),
+                    width=1,
+                )
+
+            elif shape_name == "hexagon":
+                od.polygon(
+                    [
+                        (
+                            icon_cx + icon_r * math.cos(math.radians(k * 60.0)),
+                            cy      + icon_r * math.sin(math.radians(k * 60.0)),
+                        )
+                        for k in range(6)
+                    ],
                     fill=(120, 120, 120, 255),
                     outline=(0, 0, 0, 255),
                     width=1,
