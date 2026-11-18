@@ -1,0 +1,6217 @@
+import os
+import sys
+import json
+import math
+import copy
+import atexit
+import argparse
+import configparser
+from datetime import datetime
+from pathlib import Path
+
+# Offline mode: set from the command line (-o / --offline).
+# When True, the application never attempts to discover or open
+# a connection to the external pulse generator.  Defaults to False
+# so importing this module keeps the original behavior.
+OFFLINE_MODE = False
+
+try:
+    import winsound
+except ImportError:  # non-Windows platforms (e.g. offline testing)
+    winsound = None
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:  # allow headless testing of the pure-Python parts
+    Image = ImageDraw = ImageFont = None
+
+from PySide6.QtCore import Qt, QRectF, QPoint, QPointF, Signal
+from PySide6.QtGui import (
+    QAction,
+    QBrush,
+    QColor,
+    QFont,
+    QFontMetrics,
+    QImage,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+    QPolygonF,
+)
+from PySide6.QtWidgets import (
+    QApplication,
+    QButtonGroup,
+    QCheckBox,
+    QDialog,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFormLayout,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QRadioButton,
+    QScrollArea,
+    QSlider,
+    QVBoxLayout,
+    QWidget,
+    QInputDialog,
+)
+
+# ----------------------------------------------------------------------
+# USMELT / TG5012A
+# ----------------------------------------------------------------------
+
+import usmelt
+
+
+# ----------------------------------------------------------------------
+# Marker data
+# ----------------------------------------------------------------------
+
+MARKER_SHAPES = ("circle", "triangle", "square", "star", "diamond", "hexagon")
+
+
+def wrap_text_to_width(draw, text, font, max_width):
+    """
+    Word-wrap ``text`` so every rendered line fits within
+    ``max_width`` pixels.
+
+    Returns a list of lines (at least one).  A single word that is
+    longer than the available width is broken across lines character
+    by character, so nothing ever gets clipped horizontally and the
+    result can never loop forever on pathological input (e.g. an
+    empty font or a zero-width box).
+    """
+
+    def text_w(s):
+        bbox = draw.textbbox((0, 0), s, font=font)
+        return bbox[2] - bbox[0]
+
+    def break_word(word):
+        # Split one oversized word into width-fitting chunks.
+        chunks = []
+        current = ""
+
+        for ch in word:
+            trial = current + ch
+            if current and text_w(trial) > max_width:
+                chunks.append(current)
+                current = ch
+            else:
+                current = trial
+
+        if current:
+            chunks.append(current)
+
+        return chunks if chunks else [""]
+
+    lines = []
+
+    for paragraph in str(text).split("\n"):
+        words = paragraph.split()
+
+        if not words:
+            lines.append("")
+            continue
+
+        current = ""
+
+        for word in words:
+            candidate = f"{current} {word}" if current else word
+
+            if text_w(candidate) <= max_width:
+                current = candidate
+                continue
+
+            # The candidate does not fit: flush what we have.
+            if current:
+                lines.append(current)
+                current = ""
+
+            if text_w(word) <= max_width:
+                current = word
+            else:
+                # Single word wider than the box: hard-break it so
+                # the long label stays fully readable instead of
+                # running off the edge of the legend.
+                chunks = break_word(word)
+                for chunk in chunks[:-1]:
+                    lines.append(chunk)
+                current = chunks[-1]
+
+        if current:
+            lines.append(current)
+
+    return lines
+
+
+# Markers placed at exactly this voltage are "Test" markers: they are
+# rendered with the fixed test color and are not counted as real
+# sample markers (see the marker counter in the left task bar).
+TEST_VOLTAGE = 5.0
+
+
+def is_test_voltage(voltage):
+    """True if ``voltage`` corresponds to a "Test" marker (5 V)."""
+    try:
+        return math.isclose(
+            float(voltage),
+            TEST_VOLTAGE,
+            abs_tol=1e-9,
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def count_real_markers(markers):
+    """Number of markers that are *not* "Test" (5 V) markers."""
+    return sum(
+        1
+        for marker in markers
+        if not getattr(marker, "is_test", False)
+    )
+
+
+def draw_marker_shape(draw, shape, cx, cy, size, fill, outline=(0, 0, 0),
+                      width=None):
+    """Draw a marker of the given shape centered at (cx, cy).
+
+    All shapes fit inside a circle of diameter ``size`` so they look
+    visually balanced next to each other.  Coloring is identical for
+    every shape - only the geometry changes.
+    """
+    if width is None:
+        width = max(1, int(size / 8))
+
+    r = size / 2.0
+    bbox = [cx - r, cy - r, cx + r, cy + r]
+
+    if shape == "circle":
+        draw.ellipse(bbox, fill=fill, outline=outline, width=width)
+        return
+
+    if shape == "square":
+        # Square inscribed in the same circle as the other shapes.
+        half = r / math.sqrt(2.0)
+        draw.polygon(
+            [
+                (cx - half, cy - half),
+                (cx + half, cy - half),
+                (cx + half, cy + half),
+                (cx - half, cy + half),
+            ],
+            fill=fill,
+            outline=outline,
+            width=width,
+        )
+        return
+
+    if shape == "triangle":
+        # Equilateral triangle pointing up, vertices on the circle.
+        pts = []
+        for k in range(3):
+            ang = math.radians(-90.0 + k * 120.0)
+            pts.append((cx + r * math.cos(ang), cy + r * math.sin(ang)))
+        draw.polygon(pts, fill=fill, outline=outline, width=width)
+        return
+
+    if shape == "star":
+        # Classic five-point star alternating outer/inner radii.
+        inner = r * 0.45
+        pts = []
+        for k in range(10):
+            ang = math.radians(-90.0 + k * 36.0)
+            rad = r if k % 2 == 0 else inner
+            pts.append((cx + rad * math.cos(ang), cy + rad * math.sin(ang)))
+        draw.polygon(pts, fill=fill, outline=outline, width=width)
+        return
+
+    if shape == "diamond":
+        # Four-point rhombus: top / right / bottom / left on the circle.
+        pts = [
+            (cx,       cy - r),
+            (cx + r,   cy),
+            (cx,       cy + r),
+            (cx - r,   cy),
+        ]
+        draw.polygon(pts, fill=fill, outline=outline, width=width)
+        return
+
+    if shape == "hexagon":
+        # Regular hexagon, flat-top orientation.
+        pts = []
+        for k in range(6):
+            ang = math.radians(k * 60.0)
+            pts.append((cx + r * math.cos(ang), cy + r * math.sin(ang)))
+        draw.polygon(pts, fill=fill, outline=outline, width=width)
+        return
+
+    # Unknown shape: fall back to a circle.
+    draw.ellipse(bbox, fill=fill, outline=outline, width=width)
+
+
+class Marker:
+    def __init__(self, x, y, size=40, voltage=0.0, is_test=False,
+                 shape="circle"):
+        self.x = float(x)
+        self.y = float(y)
+        self.size = int(size)
+        self.voltage = float(voltage)
+        self.is_test = bool(is_test)
+        self.shape = str(shape) if shape in MARKER_SHAPES else "circle"
+
+    def to_dict(self):
+        """Serialize the marker for session files (see SESSION_VERSION)."""
+        return {
+            "x": self.x,
+            "y": self.y,
+            "size": self.size,
+            "voltage": self.voltage,
+            "is_test": self.is_test,
+            "shape": self.shape,
+            # True for the most recently placed marker.  The highlight
+            # ring itself is GUI-only (never drawn into exported
+            # images); this flag merely records *which* marker should
+            # carry it so the position survives a saved session and the
+            # user can find where they left off after an interruption.
+            "last": bool(getattr(self, "is_last", False)),
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        """Rebuild a marker from its serialized dict."""
+        marker = cls(
+            x=data.get("x", 0.0),
+            y=data.get("y", 0.0),
+            size=data.get("size", 40),
+            voltage=data.get("voltage", 0.0),
+            is_test=data.get("is_test", False),
+            shape=data.get("shape", "circle"),
+        )
+
+        marker.is_last = bool(data.get("last", False))
+
+        return marker
+
+
+# ----------------------------------------------------------------------
+# Session files (save / load marking sessions as JSON)
+#
+# A session records everything needed to resume working later:
+#   * the path of the originally opened image (the pixels themselves
+#     are NOT embedded — only the path is stored),
+#   * every placed marker (position, shape, size, voltage, test flag),
+#   * the toolbar parameters (per-shape legend labels, selected shape,
+#     image rotation, marker size, color-scale endpoints),
+#   * optionally the USMELT panel parameters.
+#
+# JSON was chosen because it is human readable, part of the standard
+# library and easy to extend.  ``SESSION_VERSION`` lets future readers
+# cope with older files; unknown keys are ignored on load.
+# ----------------------------------------------------------------------
+
+SESSION_VERSION = 1
+SESSION_EXTENSION = ".usmark.json"
+
+# Crash protection: the session is auto-saved in the background after
+# every marker placement/removal (see ImageMarkerApp.autosave_session).
+# Exactly one autosave file exists, stored in a sub-directory next to
+# this program; opening a new image starts a new session and simply
+# overwrites it.  On startup the most recent autosave is offered for
+# recovery (see maybe_restore_autosave_on_startup).
+AUTOSAVE_DIRNAME = "autosaves"
+AUTOSAVE_FILE_NAME = "autosave.usmark.json"
+
+
+def _autosave_dir():
+    """Folder holding the single crash-recovery autosave file."""
+    return Path(__file__).resolve().parent / AUTOSAVE_DIRNAME
+
+
+def _json_default(obj):
+    """Fallback encoder so stray Qt/path objects never break saving."""
+    if isinstance(obj, Path):
+        return str(obj)
+    return str(obj)
+
+
+def _write_json_atomically(path, data):
+    """Write JSON safely: temp file in the target folder + atomic rename.
+
+    Used by the autosave (and regular session saves) so a crash that
+    happens *during* the write can never leave a half-written file at
+    the destination — readers always see either the previous complete
+    snapshot or the new complete one.  Raises OSError on failure so
+    callers can handle it (autosave treats it as best-effort).
+    """
+    path = Path(path)
+
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    tmp_path = path.with_name(path.name + ".tmp")
+
+    try:
+        with open(
+            tmp_path,
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            json.dump(
+                data,
+                handle,
+                indent=2,
+                ensure_ascii=False,
+                default=_json_default,
+            )
+
+        os.replace(
+            tmp_path,
+            path,
+        )
+
+    except OSError:
+        # Never leave litter behind if the write failed midway.
+        try:
+            tmp_path.unlink(missing_ok=True)
+
+        except OSError:
+            pass
+
+        raise
+
+
+def marker_list_to_dicts(markers):
+    return [m.to_dict() for m in markers]
+
+
+def marker_dicts_to_list(data):
+    markers = []
+
+    for entry in data or []:
+        if not isinstance(entry, dict):
+            continue
+
+        try:
+            markers.append(Marker.from_dict(entry))
+        except (TypeError, ValueError):
+            # Skip malformed entries instead of failing the whole load.
+            continue
+
+    # Exactly one marker may carry the "last placed" highlight; a
+    # hand-edited or legacy file could contain none or several.  Keep
+    # the last flagged entry (falling back to no highlight at all is
+    # also fine — sessions saved before this feature simply have no
+    # "last" key and nothing is highlighted until a new marker lands).
+    flagged = [m for m in markers if getattr(m, "is_last", False)]
+
+    for m in flagged[:-1]:
+        m.is_last = False
+
+    return markers
+
+
+# ----------------------------------------------------------------------
+# Shape preview icon (drawn with QPainter for the toolbar rows)
+# ----------------------------------------------------------------------
+
+class ShapeIconWidget(QWidget):
+    """Small fixed-size widget that paints a single marker shape."""
+
+    def __init__(self, shape="circle", parent=None):
+        super().__init__(parent)
+
+        self.shape = shape if shape in MARKER_SHAPES else "circle"
+
+        self.setFixedSize(28, 28)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        w = self.width()
+        h = self.height()
+
+        cx = w / 2.0
+        cy = h / 2.0
+
+        r = min(w, h) / 2.0 - 3.0
+
+        painter.setPen(QPen(QColor(0, 0, 0), 1.5))
+        painter.setBrush(QColor(120, 120, 120))
+
+        if self.shape == "circle":
+            painter.drawEllipse(QRectF(cx - r, cy - r, 2 * r, 2 * r))
+
+        elif self.shape == "square":
+            half = r / math.sqrt(2.0)
+            painter.drawRect(
+                QRectF(cx - half, cy - half, 2 * half, 2 * half))
+
+        elif self.shape == "triangle":
+            pts = QPolygonF()
+            for k in range(3):
+                ang = math.radians(-90.0 + k * 120.0)
+                pts.append(QPointF(cx + r * math.cos(ang),
+                                   cy + r * math.sin(ang)))
+            painter.drawPolygon(pts)
+
+        elif self.shape == "star":
+            inner = r * 0.45
+            pts = QPolygonF()
+            for k in range(10):
+                ang = math.radians(-90.0 + k * 36.0)
+                rad = r if k % 2 == 0 else inner
+                pts.append(QPointF(cx + rad * math.cos(ang),
+                                   cy + rad * math.sin(ang)))
+            painter.drawPolygon(pts)
+
+        elif self.shape == "diamond":
+            pts = QPolygonF([
+                QPointF(cx,       cy - r),
+                QPointF(cx + r,   cy),
+                QPointF(cx,       cy + r),
+                QPointF(cx - r,   cy),
+            ])
+            painter.drawPolygon(pts)
+
+        elif self.shape == "hexagon":
+            pts = QPolygonF()
+            for k in range(6):
+                ang = math.radians(k * 60.0)
+                pts.append(QPointF(cx + r * math.cos(ang),
+                                   cy + r * math.sin(ang)))
+            painter.drawPolygon(pts)
+
+
+# ----------------------------------------------------------------------
+# Image canvas
+# ----------------------------------------------------------------------
+
+class ImageCanvas(QWidget):
+    marker_added = Signal(float, float)
+    # Emitted when the user right-clicks; the app removes the nearest
+    # marker to this base-image coordinate.
+    marker_remove_requested = Signal(float, float)
+
+    def __init__(self, parent=None):
+        super().__init__()
+
+        # The canvas is embedded inside a QScrollArea later on, so its
+        # real Qt parent is NOT the main window. Keep an explicit
+        # reference to the app instead; voltage_to_color() needs it to
+        # read the color scale endpoints (otherwise it silently fell
+        # back to hardcoded blue and every marker/legend looked blue).
+        self.app = parent
+
+        self.setMinimumSize(500, 500)
+        self.setMouseTracking(True)
+
+        self.base_image = None
+        self.display_image = None
+        self.display_pixmap = QPixmap()
+        self.display_rect = QRectF()
+
+        # Path of the file the base image was loaded from (None when no
+        # image is open).  Session files store this path instead of the
+        # pixels, so a session can be reopened later.
+        self.image_path = None
+
+        self.zoom = 1.0
+        self.rotation = 0.0
+
+        self.pan_x = 0.0
+        self.pan_y = 0.0
+
+        self.markers = []
+
+        self.middle_dragging = False
+        self.left_dragging = False
+        self.last_mouse_pos = QPoint()
+
+        # --- Guide mesh state ----------------------------------------
+        # All parameters live in base-image pixel coordinates so that
+        # the mesh follows image zoom/pan/rotation automatically.
+        self.guide_spacing   = 100.0  # px between adjacent nodes
+        self.guide_angle     = 0.0    # mesh rotation (degrees)
+        self.guide_offset_x  = 0.0   # mesh origin x (base-image px)
+        self.guide_offset_y  = 0.0   # mesh origin y (base-image px)
+        # "off"         – mesh hidden, normal image nav
+        # "calibrating" – user clicks 3 points to define the mesh
+        # "preview"     – mesh calculated from clicks; awaiting accept/retry
+        # "applied"     – mesh locked; image nav restored, snapping active
+        self.guide_mode         = "off"
+        self.guide_calib_points = []  # list of (bx, by) base-image tuples
+
+    # ------------------------------------------------------------------
+
+    def set_image(self, image, image_path=None):
+        self.base_image = image.copy()
+        self.image_path = str(image_path) if image_path else None
+        self.zoom = 1.0
+        self.rotation = 0.0
+        self.pan_x = 0.0
+        self.pan_y = 0.0
+        self.markers = []
+        self.render_image()
+
+    # ------------------------------------------------------------------
+
+    def set_markers(self, markers):
+        self.markers = markers
+        self.render_image()
+
+    # ------------------------------------------------------------------
+
+    def set_rotation(self, angle):
+        self.rotation = float(angle)
+        self.render_image()
+
+    # ------------------------------------------------------------------
+
+    def set_guide_mode(self, mode):
+        """Set guide mode: 'off', 'calibrating', 'preview', or 'applied'."""
+        assert mode in ("off", "calibrating", "preview", "applied")
+        if mode == "calibrating":
+            self.guide_calib_points = []
+            self.setCursor(Qt.CrossCursor)
+        else:
+            self.setCursor(Qt.ArrowCursor)
+        self.guide_mode = mode
+        self.update()
+
+    def set_guide_angle(self, angle):
+        """Set the mesh rotation angle in degrees and repaint."""
+        self.guide_angle = float(angle)
+        self.update()
+
+    def set_guide_spacing(self, spacing):
+        """Set the mesh node spacing (base-image pixels) and repaint."""
+        self.guide_spacing = max(5.0, float(spacing))
+        self.update()
+
+    # ------------------------------------------------------------------
+
+    def _calculate_guide_from_points(self, p1, p2, pn):
+        """Compute mesh parameters from three calibration points.
+
+        p1 = S1, p2 = S2 (adjacent square, same row),
+        pn = Sn (a farther square in the same row).
+        All coordinates are base-image pixels.
+
+        Strategy: the long S1→Sn baseline is used for both the angle
+        and the final spacing so that S1 and Sn land exactly on nodes.
+        S2 is used only to estimate the integer number of intervals
+        between S1 and Sn (so a slightly mis-clicked S2 cannot skew
+        the spacing across the whole field).
+
+        Returns (spacing, angle_deg, offset_x, offset_y) or None when
+        the points are too close together to yield a useful mesh.
+        """
+        # Long baseline S1 → Sn.
+        dx1n = pn[0] - p1[0]
+        dy1n = pn[1] - p1[1]
+        dist1n = math.sqrt(dx1n * dx1n + dy1n * dy1n)
+
+        # Short step S1 → S2 (one square width, roughly).
+        dx12 = p2[0] - p1[0]
+        dy12 = p2[1] - p1[1]
+        dist12 = math.sqrt(dx12 * dx12 + dy12 * dy12)
+
+        if dist12 < 2.0 or dist1n < dist12 * 0.5:
+            return None
+
+        # Project S1→S2 onto the S1→Sn unit vector so that any
+        # perpendicular click error in S2 does not inflate the estimate.
+        ux = dx1n / dist1n
+        uy = dy1n / dist1n
+        dist12_along_axis = abs(dx12 * ux + dy12 * uy)
+        if dist12_along_axis < 2.0:
+            return None
+
+        # Number of intervals from S1 to Sn, rounded to nearest integer.
+        n = max(1, round(dist1n / dist12_along_axis))
+
+        # Angle from long baseline — far more accurate than S1→S2 alone.
+        angle_deg = math.degrees(math.atan2(dy1n, dx1n))
+
+        # Spacing: divide long baseline by n.
+        # This guarantees S1 (offset) and Sn are exact mesh nodes,
+        # so the alignment error cannot accumulate across the field.
+        spacing = dist1n / n
+
+        if spacing < 2.0:
+            return None
+
+        # Mesh origin: S1 is node (0, 0).
+        return spacing, angle_deg, p1[0], p1[1]
+
+    # ------------------------------------------------------------------
+
+    def _base_to_widget(self, bx, by):
+        """Convert base-image coordinates to widget (screen) coordinates."""
+        if self.base_image is None or self.display_image is None:
+            return None
+        rw = self.display_image.width
+        rh = self.display_image.height
+        if self.display_rect.width() <= 0 or self.display_rect.height() <= 0:
+            return None
+        cx_base = self.base_image.width  / 2.0
+        cy_base = self.base_image.height / 2.0
+        cx_rot  = rw / 2.0
+        cy_rot  = rh / 2.0
+        dx = bx - cx_base
+        dy = by - cy_base
+        # Inverse of rotated_to_base_image (rotate by −θ in base space).
+        theta = math.radians(self.rotation)
+        cos_t = math.cos(theta)
+        sin_t = math.sin(theta)
+        rx = dx * cos_t + dy * sin_t + cx_rot
+        ry = -dx * sin_t + dy * cos_t + cy_rot
+        wx = self.display_rect.left() + rx * self.display_rect.width()  / rw
+        wy = self.display_rect.top()  + ry * self.display_rect.height() / rh
+        return wx, wy
+
+    def _widget_delta_to_base(self, dwx, dwy):
+        """Convert a screen-space translation to a base-image translation."""
+        if self.display_image is None or self.display_rect.width() <= 0:
+            return 0.0, 0.0
+        rw = self.display_image.width
+        rh = self.display_image.height
+        drx = dwx * rw / self.display_rect.width()
+        dry = dwy * rh / self.display_rect.height()
+        theta = math.radians(self.rotation)
+        cos_t = math.cos(theta)
+        sin_t = math.sin(theta)
+        dbx = drx * cos_t - dry * sin_t
+        dby = drx * sin_t + dry * cos_t
+        return dbx, dby
+
+    # ------------------------------------------------------------------
+
+    def snap_to_guide(self, bx, by):
+        """Return the nearest mesh node to base-image point (bx, by)."""
+        s = self.guide_spacing
+        if s < 1:
+            return bx, by
+        cos_a = math.cos(math.radians(self.guide_angle))
+        sin_a = math.sin(math.radians(self.guide_angle))
+        dx = bx - self.guide_offset_x
+        dy = by - self.guide_offset_y
+        fi = (dx * cos_a + dy * sin_a) / s
+        fj = (-dx * sin_a + dy * cos_a) / s
+        i  = round(fi)
+        j  = round(fj)
+        nx = self.guide_offset_x + i * s * cos_a - j * s * sin_a
+        ny = self.guide_offset_y + i * s * sin_a + j * s * cos_a
+        return nx, ny
+
+    # ------------------------------------------------------------------
+
+    def _draw_guide_overlay(self, painter):
+        """Draw the guide mesh overlay on the widget."""
+        if self.guide_mode == "off" or self.base_image is None:
+            return
+        if self.display_pixmap.isNull() or self.display_image is None:
+            return
+        if self.display_rect.width() <= 0:
+            return
+
+        painter.setRenderHint(QPainter.Antialiasing, True)
+
+        # ── Calibrating: show collected points and instruction HUD ──────
+        if self.guide_mode == "calibrating":
+            pt_colors = [
+                QColor(50,  220, 100),   # S1 — green
+                QColor(255, 200,  50),   # S2 — yellow
+                QColor(255, 120,  50),   # Sn — orange
+            ]
+            pt_labels = ["S1", "S2", "Sn"]
+            instructions = [
+                "Click S1 — centre of any grid square",
+                "Click S2 — centre of the adjacent grid square (same row)",
+                "Click Sn — centre of a far grid square in the same row",
+            ]
+
+            mono_font = painter.font()
+            mono_font.setFamily("Monospace")
+            mono_font.setPointSize(10)
+            mono_font.setBold(True)
+
+            for idx, pt_base in enumerate(self.guide_calib_points):
+                pt_w = self._base_to_widget(*pt_base)
+                if pt_w is None:
+                    continue
+                color = pt_colors[idx]
+                # Dot
+                painter.setPen(QPen(QColor(0, 0, 0, 180), 1.5))
+                painter.setBrush(QBrush(color))
+                painter.drawEllipse(QPointF(*pt_w), 6.0, 6.0)
+                # Label
+                painter.setFont(mono_font)
+                painter.setPen(QPen(color))
+                painter.drawText(
+                    QPointF(pt_w[0] + 10, pt_w[1] - 6), pt_labels[idx]
+                )
+
+            n_placed = len(self.guide_calib_points)
+            hud_text = (
+                instructions[n_placed]
+                if n_placed < 3
+                else "Calculating…"
+            )
+            hud_font = painter.font()
+            hud_font.setFamily("Monospace")
+            hud_font.setPointSize(9)
+            hud_font.setBold(False)
+            painter.setFont(hud_font)
+            painter.setPen(QColor(50, 220, 100, 230))
+            painter.drawText(8, self.height() - 8, hud_text)
+            return
+
+        # ── Shared mesh geometry (preview + applied) ────────────────────
+        s     = self.guide_spacing
+        cos_a = math.cos(math.radians(self.guide_angle))
+        sin_a = math.sin(math.radians(self.guide_angle))
+        W     = float(self.base_image.width)
+        H     = float(self.base_image.height)
+
+        corners_base = [(0.0, 0.0), (W, 0.0), (W, H), (0.0, H)]
+        fi_list, fj_list = [], []
+        for cbx, cby in corners_base:
+            dx = cbx - self.guide_offset_x
+            dy = cby - self.guide_offset_y
+            fi_list.append(( dx * cos_a + dy * sin_a) / s)
+            fj_list.append((-dx * sin_a + dy * cos_a) / s)
+
+        i_min = math.floor(min(fi_list)) - 1
+        i_max = math.ceil(max(fi_list))  + 1
+        j_min = math.floor(min(fj_list)) - 1
+        j_max = math.ceil(max(fj_list))  + 1
+
+        def node_w(ni, nj):
+            nbx = self.guide_offset_x + ni * s * cos_a - nj * s * sin_a
+            nby = self.guide_offset_y + ni * s * sin_a + nj * s * cos_a
+            return self._base_to_widget(nbx, nby)
+
+        wrect = self.rect()
+
+        # ── Preview: lines + dots + HUD ─────────────────────────────────
+        if self.guide_mode == "preview":
+            line_color = QColor(255, 210, 50, 200)
+            node_color = QColor(255, 210, 50, 240)
+
+            pen = QPen(line_color, 1.2, Qt.SolidLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+
+            for j in range(j_min, j_max + 1):
+                p1 = node_w(i_min, j)
+                p2 = node_w(i_max, j)
+                if p1 and p2:
+                    painter.drawLine(QPointF(*p1), QPointF(*p2))
+
+            for i in range(i_min, i_max + 1):
+                p1 = node_w(i, j_min)
+                p2 = node_w(i, j_max)
+                if p1 and p2:
+                    painter.drawLine(QPointF(*p1), QPointF(*p2))
+
+            n_nodes = (i_max - i_min + 1) * (j_max - j_min + 1)
+            if n_nodes <= 2500:
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(node_color))
+                for ni in range(i_min, i_max + 1):
+                    for nj in range(j_min, j_max + 1):
+                        pt = node_w(ni, nj)
+                        if pt and wrect.contains(int(pt[0]), int(pt[1])):
+                            painter.drawEllipse(QPointF(*pt), 3.5, 3.5)
+
+            hud_font = painter.font()
+            hud_font.setFamily("Monospace")
+            hud_font.setPointSize(9)
+            painter.setFont(hud_font)
+            painter.setPen(QColor(255, 210, 50, 230))
+            painter.drawText(
+                8, self.height() - 8,
+                f"spacing: {s:.0f} px   angle: {self.guide_angle:.1f}°"
+                "   → Accept Guide or Retry",
+            )
+            return
+
+        # ── Applied: subtle dots only (no lines) ────────────────────────
+        if self.guide_mode == "applied":
+            node_color = QColor(80, 180, 255, 110)
+            n_nodes = (i_max - i_min + 1) * (j_max - j_min + 1)
+            if n_nodes > 4000:
+                return  # too many to draw without lag
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(node_color))
+            for ni in range(i_min, i_max + 1):
+                for nj in range(j_min, j_max + 1):
+                    pt = node_w(ni, nj)
+                    if pt and wrect.contains(int(pt[0]), int(pt[1])):
+                        painter.drawEllipse(QPointF(*pt), 2.0, 2.0)
+
+    # ------------------------------------------------------------------
+
+    def reset_view(self):
+        self.zoom = 1.0
+        self.rotation = 0.0
+        self.pan_x = 0.0
+        self.pan_y = 0.0
+        self.render_image()
+
+    # ------------------------------------------------------------------
+
+    def zoom_by(self, factor, center=None):
+        old_zoom = self.zoom
+
+        new_zoom = max(0.05, min(old_zoom * factor, 20.0))
+
+        if new_zoom == old_zoom:
+            return
+
+        scale = new_zoom / old_zoom
+        self.zoom = new_zoom
+
+        # The displayed image rect is always centered in the widget plus
+        # the pan offset (see update_display_rect), so under a pure zoom
+        # it scales about the widget center — not about the cursor. To
+        # keep the image point currently under the cursor pinned there,
+        # solve for the pan that places that same image point back under
+        # the cursor after the zoom.
+        x = self.display_rect.x()
+        y = self.display_rect.y()
+        w = self.display_rect.width()
+        h = self.display_rect.height()
+
+        if w <= 0 or h <= 0:
+            self.render_image()
+            return
+
+        if center is not None:
+            ax = float(center.x())
+            ay = float(center.y())
+        else:
+            ax = self.width() / 2.0
+            ay = self.height() / 2.0
+
+        # Fractional position of the anchor within the current image rect.
+        u = (ax - x) / w
+        v = (ay - y) / h
+
+        new_w = w * scale
+        new_h = h * scale
+
+        # New rect center is (widget_size/2 + pan); choose pan so that
+        # anchor = center + (u - 1/2) * new_size.
+        self.pan_x = ax - (self.width() - new_w) / 2.0 - u * new_w
+        self.pan_y = ay - (self.height() - new_h) / 2.0 - v * new_h
+
+        self.render_image()
+
+    # ------------------------------------------------------------------
+
+    def pil_to_qpixmap(self, image):
+        rgb = image.convert("RGB")
+        data = rgb.tobytes("raw", "RGB")
+
+        qimage = QImage(
+            data,
+            rgb.width,
+            rgb.height,
+            rgb.width * 3,
+            QImage.Format_RGB888,
+        ).copy()
+
+        return QPixmap.fromImage(qimage)
+
+    # ------------------------------------------------------------------
+
+    def render_image(self):
+        if self.base_image is None:
+            self.display_image = None
+            self.display_pixmap = QPixmap()
+            self.update()
+            return
+
+        image = self.base_image.copy()
+
+        # Draw markers on the unrotated base image.
+        draw = ImageDraw.Draw(image)
+
+        for marker in self.markers:
+            if marker.is_test:
+                fill = (255, 0, 0)
+            else:
+                fill = self.voltage_to_color(marker.voltage)
+
+            draw_marker_shape(
+                draw,
+                getattr(marker, "shape", "circle"),
+                marker.x,
+                marker.y,
+                marker.size,
+                fill,
+            )
+
+        if abs(self.rotation) > 1e-9:
+            image = image.rotate(
+                self.rotation,
+                expand=True,
+                fillcolor=(30, 30, 30),
+            )
+
+        self.display_image = image
+        self.display_pixmap = self.pil_to_qpixmap(image)
+
+        self.update_display_rect()
+
+    # ------------------------------------------------------------------
+
+    def voltage_to_color(self, voltage):
+        # Use the explicit app reference; self.parent() is unreliable
+        # here because the widget hierarchy may differ from the logical
+        # owner passed in the constructor.
+        app = getattr(self, "app", None)
+
+        if app is None or not hasattr(app, "color_min"):
+            return (0, 0, 255)
+
+        vmin = app.color_min
+        vmax = app.color_max
+
+        if vmax <= vmin:
+            return (0, 0, 255)
+
+        if voltage is None:
+            return (0, 0, 255)
+
+        t = (float(voltage) - vmin) / (vmax - vmin)
+        t = max(0.0, min(1.0, t))
+
+        # Blue -> cyan -> green -> yellow -> orange -> magenta
+        # (an earlier refactor replaced the anchor colors with a ramp
+        # that ended in pure red; the ramp now spans six anchors).
+        anchors = [
+            (0, 0, 255),      # blue
+            (0, 255, 255),    # cyan
+            (0, 255, 0),      # green
+            (255, 255, 0),    # yellow
+            (255, 165, 0),    # orange
+            (255, 0, 255),    # magenta
+        ]
+
+        n = len(anchors) - 1
+        seg = min(int(t * n), n - 1)
+        u = t * n - seg
+        start, end = anchors[seg], anchors[seg + 1]
+
+        return tuple(
+            int(start[i] + (end[i] - start[i]) * u)
+            for i in range(3)
+        )
+
+    # ------------------------------------------------------------------
+
+    def update_display_rect(self):
+        if self.display_pixmap.isNull():
+            self.display_rect = QRectF()
+            self.update()
+            return
+
+        iw = self.display_pixmap.width()
+        ih = self.display_pixmap.height()
+
+        available_w = self.width()
+        available_h = self.height()
+
+        scale = min(
+            available_w / iw,
+            available_h / ih,
+        )
+
+        scale *= self.zoom
+
+        w = iw * scale
+        h = ih * scale
+
+        x = (available_w - w) / 2.0 + self.pan_x
+        y = (available_h - h) / 2.0 + self.pan_y
+
+        self.display_rect = QRectF(x, y, w, h)
+
+        self.update()
+
+    # ------------------------------------------------------------------
+
+    def resizeEvent(self, event):
+        self.update_display_rect()
+        super().resizeEvent(event)
+
+    # ------------------------------------------------------------------
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+
+        painter.fillRect(
+            self.rect(),
+            QColor(25, 25, 25),
+        )
+
+        if self.display_pixmap.isNull():
+            painter.setPen(Qt.white)
+
+            painter.drawText(
+                self.rect(),
+                Qt.AlignCenter,
+                "Open an image",
+            )
+
+            return
+
+        source_rect = QRectF(
+            0,
+            0,
+            self.display_pixmap.width(),
+            self.display_pixmap.height(),
+        )
+
+        painter.drawPixmap(
+            self.display_rect,
+            self.display_pixmap,
+            source_rect,
+        )
+
+        self._draw_guide_overlay(painter)
+
+        # ------------------------------------------------------------------
+        # "Last placed marker" highlight (GUI-only overlay).
+        #
+        # A dashed double ring around the most recently placed marker so
+        # an interrupted session can be resumed at a glance.  It is
+        # painted directly on the widget — never into display_image —
+        # so exported images and any pixel readback of the canvas are
+        # unaffected.
+        # ------------------------------------------------------------------
+        last_marker = next(
+            (m for m in reversed(self.markers)
+             if getattr(m, "is_last", False)),
+            None,
+        )
+
+        if last_marker is not None and self.base_image is not None:
+            rw = self.display_image.width
+            rh = self.display_image.height
+
+            # Base-image coords -> rotated-display coords.
+            if abs(self.rotation) > 1e-9:
+                bx = float(last_marker.x) - self.base_image.width / 2.0
+                by = float(last_marker.y) - self.base_image.height / 2.0
+
+                theta = math.radians(-self.rotation)
+                cos_t = math.cos(theta)
+                sin_t = math.sin(theta)
+
+                ix = bx * cos_t - by * sin_t + rw / 2.0
+                iy = bx * sin_t + by * cos_t + rh / 2.0
+            else:
+                ix = float(last_marker.x)
+                iy = float(last_marker.y)
+
+            # Display-image coords -> widget coords.
+            wx = (self.display_rect.left()
+                  + ix * self.display_rect.width() / rw)
+            wy = (self.display_rect.top()
+                  + iy * self.display_rect.height() / rh)
+
+            # Marker radius in widget pixels (marker size is stored
+            # in base-image pixels; both axes share one scale).
+            r_px = (int(last_marker.size) / 2.0
+                    * self.display_rect.width() / rw)
+
+            ring_r = max(r_px + 4.0, 8.0)
+
+            painter.setRenderHint(QPainter.Antialiasing, True)
+
+            # Dark halo underneath so the ring stays visible on
+            # bright backgrounds too.
+            pen_dark = QPen(QColor(0, 0, 0, 200), 3.0)
+            pen_dark.setStyle(Qt.SolidLine)
+            painter.setPen(pen_dark)
+            painter.drawEllipse(
+                QPointF(wx, wy), ring_r, ring_r)
+
+            # Bright dashed ring on top.
+            pen_bright = QPen(QColor(255, 255, 0, 235), 1.6)
+            pen_bright.setStyle(Qt.DashLine)
+            painter.setPen(pen_bright)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawEllipse(
+                QPointF(wx, wy), ring_r, ring_r)
+
+            # Small inward second ring makes the marker unmistakable.
+            inner_r = max(r_px + 1.5, 4.0)
+            pen_inner = QPen(QColor(255, 255, 0, 170), 1.2)
+            pen_inner.setStyle(Qt.SolidLine)
+            painter.setPen(pen_inner)
+            painter.drawEllipse(
+                QPointF(wx, wy), inner_r, inner_r)
+
+    # ------------------------------------------------------------------
+
+    def widget_to_rotated_image(self, pos):
+        if self.display_pixmap.isNull():
+            return None
+
+        if (
+            self.display_rect.width() <= 0
+            or self.display_rect.height() <= 0
+        ):
+            return None
+
+        x = (
+            (pos.x() - self.display_rect.left())
+            * self.display_pixmap.width()
+            / self.display_rect.width()
+        )
+
+        y = (
+            (pos.y() - self.display_rect.top())
+            * self.display_pixmap.height()
+            / self.display_rect.height()
+        )
+
+        return x, y
+
+    # ------------------------------------------------------------------
+
+    def rotated_to_base_image(self, x, y):
+        if self.base_image is None or self.display_image is None:
+            return None
+
+        cx_rotated = self.display_image.width / 2.0
+        cy_rotated = self.display_image.height / 2.0
+
+        cx_base = self.base_image.width / 2.0
+        cy_base = self.base_image.height / 2.0
+
+        dx = x - cx_rotated
+        dy = y - cy_rotated
+
+        theta = math.radians(self.rotation)
+
+        cos_t = math.cos(theta)
+        sin_t = math.sin(theta)
+
+        base_dx = dx * cos_t - dy * sin_t
+        base_dy = dx * sin_t + dy * cos_t
+
+        bx = base_dx + cx_base
+        by = base_dy + cy_base
+
+        return bx, by
+
+    # ------------------------------------------------------------------
+
+    def _emit_marker_at(self, pos):
+        """
+        Map a widget position to base-image coordinates and, if it
+        lands inside the image, emit marker_added. Returns True when
+        a marker placement was emitted.
+        """
+        rotated = self.widget_to_rotated_image(
+            pos.toPoint()
+        )
+
+        if rotated is None:
+            return False
+
+        base = self.rotated_to_base_image(
+            *rotated
+        )
+
+        if base is None:
+            return False
+
+        bx, by = base
+
+        if self.guide_mode == "applied":
+            bx, by = self.snap_to_guide(bx, by)
+            # Reject duplicate: a marker already occupies this node.
+            for m in self.markers:
+                if abs(m.x - bx) < 0.5 and abs(m.y - by) < 0.5:
+                    return False
+
+        if (
+            self.base_image is not None
+            and 0 <= bx < self.base_image.width
+            and 0 <= by < self.base_image.height
+        ):
+            self.marker_added.emit(bx, by)
+            return True
+
+        return False
+
+    # ------------------------------------------------------------------
+
+    def mousePressEvent(self, event):
+        # Calibrating mode: left-click collects calibration points.
+        # Middle-click still pans so the user can navigate between
+        # widely-spaced grid squares.  Markers are never placed here.
+        if self.guide_mode == "calibrating":
+            if event.button() == Qt.LeftButton:
+                rotated = self.widget_to_rotated_image(
+                    event.position().toPoint()
+                )
+                if rotated is not None:
+                    base = self.rotated_to_base_image(*rotated)
+                    if base is not None:
+                        self.guide_calib_points.append(base)
+                        if len(self.guide_calib_points) == 3:
+                            result = self._calculate_guide_from_points(
+                                self.guide_calib_points[0],
+                                self.guide_calib_points[1],
+                                self.guide_calib_points[2],
+                            )
+                            if result is not None:
+                                (self.guide_spacing,
+                                 self.guide_angle,
+                                 self.guide_offset_x,
+                                 self.guide_offset_y) = result
+                                self.guide_mode = "preview"
+                                self.setCursor(Qt.ArrowCursor)
+                                if self.app is not None:
+                                    self.app._update_guide_ui()
+                            else:
+                                # Degenerate points — start over.
+                                self.guide_calib_points = []
+                        self.update()
+                return  # never place a marker in calibrating mode
+            if event.button() == Qt.MiddleButton:
+                self.middle_dragging = True
+                self.last_mouse_pos = event.position().toPoint()
+                self.setCursor(Qt.ClosedHandCursor)
+            return  # suppress right-click in calibrating mode
+
+        if event.button() == Qt.MiddleButton:
+            self.middle_dragging = True
+            self.last_mouse_pos = event.position().toPoint()
+            self.setCursor(Qt.ClosedHandCursor)
+            return
+
+        if event.button() == Qt.LeftButton:
+            self._emit_marker_at(event.position())
+            self.left_dragging = True
+            return
+
+        if event.button() == Qt.RightButton:
+            # Right-click: ask the app to remove the nearest marker at
+            # this position (snapped to guide node when guide is applied).
+            rotated = self.widget_to_rotated_image(event.position().toPoint())
+            if rotated is not None:
+                base = self.rotated_to_base_image(*rotated)
+                if base is not None:
+                    bx, by = base
+                    if self.guide_mode == "applied":
+                        bx, by = self.snap_to_guide(bx, by)
+                    self.marker_remove_requested.emit(bx, by)
+
+    # ------------------------------------------------------------------
+
+    def mouseMoveEvent(self, event):
+        if self.middle_dragging:
+            current = event.position().toPoint()
+
+            delta = current - self.last_mouse_pos
+
+            self.pan_x += delta.x()
+            self.pan_y += delta.y()
+
+            self.last_mouse_pos = current
+
+            self.update_display_rect()
+            return
+
+        if self.left_dragging and self.guide_mode == "applied":
+            self._emit_marker_at(event.position())
+
+    # ------------------------------------------------------------------
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.left_dragging = False
+
+        if event.button() == Qt.MiddleButton:
+            self.middle_dragging = False
+            self.setCursor(
+                Qt.CrossCursor
+                if self.guide_mode == "calibrating"
+                else Qt.ArrowCursor
+            )
+
+    # ------------------------------------------------------------------
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+
+        if delta > 0:
+            self.zoom_by(
+                1.15,
+                event.position().toPoint(),
+            )
+
+        elif delta < 0:
+            self.zoom_by(
+                1 / 1.15,
+                event.position().toPoint(),
+            )
+
+
+# ----------------------------------------------------------------------
+# USMELT waveform preview
+# ----------------------------------------------------------------------
+
+class WaveformPreview(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        self.v1 = 1.0
+        self.t1 = 10.0
+        self.v2 = 2.0
+        self.t2 = 10.0
+        self.delay = 0.0
+
+        self.setMinimumSize(400, 250)
+
+    # ------------------------------------------------------------------
+
+    def set_values(self, v1, t1, v2, t2, delay):
+        self.v1 = v1
+        self.t1 = t1
+        self.v2 = v2
+        self.t2 = t2
+        self.delay = delay
+
+        self.update()
+
+    # ------------------------------------------------------------------
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+
+        painter.fillRect(
+            self.rect(),
+            Qt.white,
+        )
+
+        width = self.width()
+        height = self.height()
+
+        left = 55
+        right = 20
+        top = 20
+        bottom = 45
+
+        plot_w = width - left - right
+        plot_h = height - top - bottom
+
+        if plot_w <= 0 or plot_h <= 0:
+            return
+
+        total_time = (
+            max(0.0, self.delay)
+            + max(0.0, self.t1)
+            + max(0.0, self.t2)
+            + 10.0
+        )
+
+        if total_time <= 0:
+            total_time = 1.0
+
+        max_voltage = max(
+            abs(self.v1),
+            abs(self.v2),
+            1.0,
+        )
+
+        # Grid.
+        painter.setPen(
+            QPen(
+                QColor(220, 220, 220),
+                1,
+            )
+        )
+
+        for i in range(6):
+            x = left + plot_w * i / 5
+
+            painter.drawLine(
+                int(x),
+                top,
+                int(x),
+                top + plot_h,
+            )
+
+        for i in range(5):
+            y = top + plot_h * i / 4
+
+            painter.drawLine(
+                left,
+                int(y),
+                left + plot_w,
+                int(y),
+            )
+
+        # Axes.
+        painter.setPen(
+            QPen(
+                Qt.black,
+                1,
+            )
+        )
+
+        painter.drawLine(
+            left,
+            top,
+            left,
+            top + plot_h,
+        )
+
+        painter.drawLine(
+            left,
+            top + plot_h,
+            left + plot_w,
+            top + plot_h,
+        )
+
+        def tx(t):
+            return left + (t / total_time) * plot_w
+
+        def ty(v):
+            return (
+                top
+                + plot_h / 2
+                - (v / max_voltage)
+                * (plot_h / 2)
+            )
+
+        points = []
+
+        t = 0.0
+
+        points.append(
+            (
+                tx(t),
+                ty(0.0),
+            )
+        )
+
+        # Delay.
+        t += max(
+            0.0,
+            self.delay,
+        )
+
+        points.append(
+            (
+                tx(t),
+                ty(0.0),
+            )
+        )
+
+        # V1.
+        points.append(
+            (
+                tx(t),
+                ty(self.v1),
+            )
+        )
+
+        t += max(
+            0.0,
+            self.t1,
+        )
+
+        points.append(
+            (
+                tx(t),
+                ty(self.v1),
+            )
+        )
+
+        # V2.
+        points.append(
+            (
+                tx(t),
+                ty(self.v2),
+            )
+        )
+
+        t += max(
+            0.0,
+            self.t2,
+        )
+
+        points.append(
+            (
+                tx(t),
+                ty(self.v2),
+            )
+        )
+
+        # 10 us tail.
+        t += 10.0
+
+        points.append(
+            (
+                tx(t),
+                ty(0.0),
+            )
+        )
+
+        polygon = QPolygonF(
+            [
+                QPoint(
+                    int(x),
+                    int(y),
+                )
+                for x, y in points
+            ]
+        )
+
+        # Filled waveform.
+        fill_path = QPainterPath()
+
+        fill_path.moveTo(
+            points[0][0],
+            top + plot_h / 2,
+        )
+
+        for x, y in points:
+            fill_path.lineTo(
+                x,
+                y,
+            )
+
+        fill_path.lineTo(
+            points[-1][0],
+            top + plot_h / 2,
+        )
+
+        fill_path.closeSubpath()
+
+        painter.fillPath(
+            fill_path,
+            QColor(220, 235, 255),
+        )
+
+        # Waveform line.
+        painter.setPen(
+            QPen(
+                QColor(0, 90, 200),
+                2,
+            )
+        )
+
+        painter.drawPolyline(
+            polygon
+        )
+
+        # Labels.
+        painter.setPen(Qt.black)
+
+        painter.setFont(
+            QFont(
+                "Helvetica",
+                8,
+            )
+        )
+
+        painter.drawText(
+            5,
+            top + 5,
+            f"{max_voltage:.2f} V",
+        )
+
+        painter.drawText(
+            5,
+            top + plot_h - 2,
+            f"{-max_voltage:.2f} V",
+        )
+
+        painter.drawText(
+            left + plot_w // 2 - 25,
+            height - 8,
+            "time (us)",
+        )
+
+        painter.drawText(
+            8,
+            top + plot_h // 2,
+            "0 V",
+        )
+
+
+# ----------------------------------------------------------------------
+# USMELT controller
+# ----------------------------------------------------------------------
+
+class MelterPanel(QGroupBox):
+    voltage_high1_changed = Signal()
+    # Emitted when the effective CH1 high voltage changes,
+    # i.e. also when pulse shaping is toggled on/off.
+    effective_voltage_changed = Signal()
+
+    def __init__(self, parent=None, offline=False):
+        super().__init__(
+            "USMELT (offline)" if offline else "USMELT",
+            parent,
+        )
+
+        # Offline mode: never discover/open the pulse generator.
+        self.offline = bool(offline) or OFFLINE_MODE
+
+        self.pg = None
+        self.device_name = ""
+
+        self.config_path = Path(
+            "usmelt.ini"
+        )
+
+        self.config = configparser.ConfigParser()
+
+        if self.config_path.exists():
+            self.config.read(
+                self.config_path
+            )
+
+        self.melt_sound = self.config.getboolean(
+            "General",
+            "MeltSound",
+            fallback=True,
+        )
+
+        # Last valid CH1 Voltage High entered by the user.
+        # Kept so that markers keep using the correct value
+        # even while the entry field temporarily holds invalid
+        # or empty text.
+        self.last_valid_voltage_high1 = 5.0
+
+        self.use_shaping_value = self.config.getboolean(
+            "PulseShaping",
+            "UseShaping",
+            fallback=False,
+        )
+
+        self.shaping_v1 = self.config.getfloat(
+            "PulseShaping",
+            "V1",
+            fallback=5.0,
+        )
+
+        self.shaping_t1 = self.config.getfloat(
+            "PulseShaping",
+            "T1",
+            fallback=10.0,
+        )
+
+        self.shaping_v2 = self.config.getfloat(
+            "PulseShaping",
+            "V2",
+            fallback=2.5,
+        )
+
+        self.shaping_t2 = self.config.getfloat(
+            "PulseShaping",
+            "T2",
+            fallback=10.0,
+        )
+
+        self.build_ui()
+
+        if self.offline:
+            # IMPORTANT: in offline mode we must not touch the
+            # device at all -- skip USMELT discovery/initialization.
+            self.pg = None
+            self.device_name = ""
+        else:
+            # IMPORTANT:
+            # Use the original USMELT discovery and initialization path.
+            try:
+                self.find_and_init_pg()
+            except Exception as exc:
+                # The port may be busy (e.g. a previous run of this
+                # program did not shut down cleanly) or simply absent.
+                # Report it instead of crashing with a raw traceback;
+                # the user can still connect later via "Set Device".
+                self.pg = None
+                QMessageBox.critical(
+                    self,
+                    "Device Error",
+                    f"Could not connect to the pulse generator: {exc}",
+                )
+
+        self.update_channel_states()
+
+    # ------------------------------------------------------------------
+
+    def build_ui(self):
+        main_layout = QVBoxLayout(self)
+
+        channels = QGridLayout()
+
+        channels.setHorizontalSpacing(8)
+        channels.setVerticalSpacing(5)
+
+        # --------------------------------------------------------------
+        # Channel 1
+        # --------------------------------------------------------------
+
+        ch1_group = QGroupBox(
+            "Channel 1"
+        )
+
+        ch1_layout = QGridLayout(
+            ch1_group
+        )
+
+        self.enable_ch1 = QCheckBox(
+            "Enable"
+        )
+
+        self.enable_ch1.toggled.connect(
+            self.toggle_ch1_elements
+        )
+
+        self.pulse_length1_entry = QLineEdit(
+            "20"
+        )
+
+        self.voltage_high1_entry = QLineEdit(
+            "5"
+        )
+
+        self.delay1_entry = QLineEdit(
+            "0"
+        )
+
+        ch1_layout.addWidget(
+            self.enable_ch1,
+            0,
+            0,
+            1,
+            2,
+        )
+
+        ch1_layout.addWidget(
+            QLabel("Pulse Length (us)"),
+            1,
+            0,
+        )
+
+        ch1_layout.addWidget(
+            self.pulse_length1_entry,
+            1,
+            1,
+        )
+
+        ch1_layout.addWidget(
+            QLabel("Voltage High (V)"),
+            2,
+            0,
+        )
+
+        ch1_layout.addWidget(
+            self.voltage_high1_entry,
+            2,
+            1,
+        )
+
+        ch1_layout.addWidget(
+            QLabel("Delay (us)"),
+            3,
+            0,
+        )
+
+        ch1_layout.addWidget(
+            self.delay1_entry,
+            3,
+            1,
+        )
+
+        self.use_shaping = QCheckBox(
+            "Use Shaping"
+        )
+
+        self.use_shaping.setChecked(
+            self.use_shaping_value
+        )
+
+        self.use_shaping.toggled.connect(
+            self.on_shaping_toggled
+        )
+
+        self.setup_shaping_button = QPushButton(
+            "Setup Shaping"
+        )
+
+        self.setup_shaping_button.clicked.connect(
+            self.open_shaping_dialog
+        )
+
+        ch1_layout.addWidget(
+            self.use_shaping,
+            4,
+            0,
+            1,
+            2,
+        )
+
+        ch1_layout.addWidget(
+            self.setup_shaping_button,
+            5,
+            0,
+            1,
+            2,
+        )
+
+        # --------------------------------------------------------------
+        # Channel 2
+        # --------------------------------------------------------------
+
+        ch2_group = QGroupBox(
+            "Channel 2"
+        )
+
+        ch2_layout = QGridLayout(
+            ch2_group
+        )
+
+        self.enable_ch2 = QCheckBox(
+            "Enable"
+        )
+
+        self.enable_ch2.toggled.connect(
+            self.toggle_ch2_elements
+        )
+
+        self.pulse_length2_entry = QLineEdit(
+            "20"
+        )
+
+        self.voltage_high2_entry = QLineEdit(
+            "5"
+        )
+
+        self.delay2_entry = QLineEdit(
+            "0"
+        )
+
+        ch2_layout.addWidget(
+            self.enable_ch2,
+            0,
+            0,
+            1,
+            2,
+        )
+
+        ch2_layout.addWidget(
+            QLabel("Pulse Length (us)"),
+            1,
+            0,
+        )
+
+        ch2_layout.addWidget(
+            self.pulse_length2_entry,
+            1,
+            1,
+        )
+
+        ch2_layout.addWidget(
+            QLabel("Voltage High (V)"),
+            2,
+            0,
+        )
+
+        ch2_layout.addWidget(
+            self.voltage_high2_entry,
+            2,
+            1,
+        )
+
+        ch2_layout.addWidget(
+            QLabel("Delay (us)"),
+            3,
+            0,
+        )
+
+        ch2_layout.addWidget(
+            self.delay2_entry,
+            3,
+            1,
+        )
+
+        channels.addWidget(
+            ch1_group,
+            0,
+            0,
+        )
+
+        channels.addWidget(
+            ch2_group,
+            0,
+            1,
+        )
+
+        main_layout.addLayout(
+            channels
+        )
+
+        # --------------------------------------------------------------
+        # Melt button
+        # --------------------------------------------------------------
+
+        self.melt_button = QPushButton(
+            "Melt"
+        )
+
+        self.melt_button.setMinimumHeight(
+            36
+        )
+
+        if self.offline:
+            # No device in offline mode: the Melt button is
+            # unavailable, but all parameter fields stay editable.
+            self.melt_button.setEnabled(False)
+            self.melt_button.setText(
+                "Melt (offline — no device)"
+            )
+            self.melt_button.setToolTip(
+                "Disabled because the application was started "
+                "with --offline; no pulse generator is connected."
+            )
+
+        self.melt_button.clicked.connect(
+            self.melt
+        )
+
+        if not self.offline:
+            # Document the right-click shortcut on the image canvas.
+            self.melt_button.setToolTip(
+                "Tip: right-clicking on the image places a marker\n"
+                "and runs this Melt action in one step."
+            )
+        else:
+            self.melt_button.setToolTip(
+                "Disabled because the application was started "
+                "with --offline; no pulse generator is connected.\n"
+                "Right-clicking on the image therefore only places "
+                "a marker (no melt)."
+            )
+
+        main_layout.addWidget(
+            self.melt_button
+        )
+
+        # Monitor current CH1 voltage field.
+        self.voltage_high1_entry.textChanged.connect(
+            self.on_voltage_high1_changed
+        )
+
+    # ------------------------------------------------------------------
+
+    def find_and_init_pg(self):
+        """
+        Original USMELT device discovery and initialization.
+
+        IMPORTANT:
+        usmelt.discover() returns a dictionary keyed by device type.
+        """
+
+        self.device_name = ""
+
+        # First find the USB device that corresponds
+        # to the pulse generator.
+        device = usmelt.discover(
+            ["TG5012A"]
+        )
+
+        self.device_name = device[
+            "TG5012A"
+        ].device
+
+        self.pg = usmelt.TG5012A(
+            serial_port=self.device_name
+        )
+
+        self.init_pg()
+
+    # ------------------------------------------------------------------
+
+    def init_pg(self):
+        """
+        Original TG5012A initialization.
+        """
+        # Full instrument reset first: clears any waveform state, active outputs,
+        # or trigger modes left by a previous (possibly force-killed) session.
+        # *RST resets everything to factory defaults; *CLS then clears the
+        # status/error registers so the device doesn't beep on reconnect.
+        self.pg.reset()
+        self.pg.clear_status()
+
+        # --- Channel 1 settings ---
+        self.pg.channel(1)
+        self.pg.wave("PULSE")
+        self.pg.pulse_period(
+            10e-3
+        )
+        self.pg.high(1)
+        self.pg.low(0)
+        self.pg.pulse_rise(
+            10e-9
+        )
+        self.pg.pulse_fall(
+            10e-9
+        )
+        self.pg.pulse_delay(0)
+        self.pg.burst("OFF")
+        self.pg.burst_count(1)
+        self.pg.trigger_src("MAN")
+        self.pg.output("OFF")
+
+        # --- Channel 2 settings ---
+        self.pg.channel(2)
+        self.pg.wave("PULSE")
+        self.pg.pulse_period(
+            10e-3
+        )
+        self.pg.high(1)
+        self.pg.low(0)
+        self.pg.pulse_rise(
+            10e-9
+        )
+        self.pg.pulse_fall(
+            10e-9
+        )
+        self.pg.pulse_delay(0)
+        self.pg.burst("OFF")
+        self.pg.burst_count(1)
+
+        # Take trigger from channel 1.
+        self.pg.trigger_src("CRC")
+        self.pg.output("OFF")
+
+    # ------------------------------------------------------------------
+
+    def on_voltage_high1_changed(self):
+        # Remember the last valid value so that markers keep using
+        # a sensible voltage even while the entry temporarily holds
+        # invalid or empty text (e.g. mid-edit).
+        try:
+            self.last_valid_voltage_high1 = float(
+                self.voltage_high1_entry.text().strip()
+            )
+        except (TypeError, ValueError):
+            pass
+
+        self.voltage_high1_changed.emit()
+
+    # ------------------------------------------------------------------
+
+    def get_voltage_high1(self):
+        try:
+            return float(
+                self.voltage_high1_entry.text().strip()
+            )
+        except (TypeError, ValueError):
+            # Fall back to the last valid value instead of None,
+            # otherwise every marker typed with an in-between edit
+            # state would be treated as "no voltage" / default.
+            return self.last_valid_voltage_high1
+
+    # ------------------------------------------------------------------
+
+    def get_effective_voltage_high1(self):
+        """
+        Return the CH1 high voltage actually used by the melt pulse.
+
+        In standard mode this is the Voltage High entry. When pulse
+        shaping is enabled, melt() drives the shaped waveform from
+        V1/V2 instead, so the entry value must not be used for the
+        marker colors (this was why markers were stuck at the
+        gradient's lower bound or flagged as Test 5.00 V).
+        """
+
+        if (
+            self.enable_ch1.isChecked()
+            and self.use_shaping.isChecked()
+        ):
+            return max(
+                0.0,
+                float(self.shaping_v1),
+                float(self.shaping_v2),
+            )
+
+        return self.get_voltage_high1()
+
+    # ------------------------------------------------------------------
+
+    def toggle_ch1_elements(self):
+        enabled = self.enable_ch1.isChecked()
+        shaping = self.use_shaping.isChecked()
+
+        # In offline mode the Enable checkbox is only used to decide
+        # whether the parameter fields are editable; it must not
+        # disable the voltage / pulse-length inputs, because markers
+        # still read their values from these fields.
+        if self.offline:
+            enabled = True
+
+        # Delay is available whenever CH1 is enabled.
+        self.delay1_entry.setEnabled(
+            enabled
+        )
+
+        # Standard pulse length is disabled during shaping.
+        self.pulse_length1_entry.setEnabled(
+            enabled and not shaping
+        )
+
+        # Voltage remains available because the marker software
+        # monitors it continuously.
+        self.voltage_high1_entry.setEnabled(
+            enabled
+        )
+
+        self.use_shaping.setEnabled(
+            enabled
+        )
+
+        self.setup_shaping_button.setEnabled(
+            enabled
+        )
+
+        # The effective CH1 voltage depends on whether shaping is
+        # active, so the marker status/colors must be refreshed.
+        self.effective_voltage_changed.emit()
+
+    # ------------------------------------------------------------------
+
+    def toggle_ch2_elements(self):
+        enabled = self.enable_ch2.isChecked()
+
+        # Same as Channel 1: keep the fields editable in offline
+        # mode regardless of the Enable checkbox.
+        if self.offline:
+            enabled = True
+
+        self.pulse_length2_entry.setEnabled(
+            enabled
+        )
+
+        self.voltage_high2_entry.setEnabled(
+            enabled
+        )
+
+        self.delay2_entry.setEnabled(
+            enabled
+        )
+
+    # ------------------------------------------------------------------
+
+    def update_channel_states(self):
+        self.toggle_ch1_elements()
+        self.toggle_ch2_elements()
+
+    # ------------------------------------------------------------------
+
+    def on_shaping_toggled(self, checked):
+        self.use_shaping_value = checked
+
+        self.toggle_ch1_elements()
+        self.save_settings()
+
+    # ------------------------------------------------------------------
+
+    def save_settings(self):
+        if not self.config.has_section(
+            "General"
+        ):
+            self.config.add_section(
+                "General"
+            )
+
+        if not self.config.has_section(
+            "PulseShaping"
+        ):
+            self.config.add_section(
+                "PulseShaping"
+            )
+
+        self.config.set(
+            "General",
+            "MeltSound",
+            str(self.melt_sound),
+        )
+
+        self.config.set(
+            "PulseShaping",
+            "UseShaping",
+            str(
+                self.use_shaping.isChecked()
+            ),
+        )
+
+        self.config.set(
+            "PulseShaping",
+            "V1",
+            str(self.shaping_v1),
+        )
+
+        self.config.set(
+            "PulseShaping",
+            "T1",
+            str(self.shaping_t1),
+        )
+
+        self.config.set(
+            "PulseShaping",
+            "V2",
+            str(self.shaping_v2),
+        )
+
+        self.config.set(
+            "PulseShaping",
+            "T2",
+            str(self.shaping_t2),
+        )
+
+        try:
+            with self.config_path.open(
+                "w",
+                encoding="utf-8",
+            ) as f:
+                self.config.write(f)
+
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "USMELT",
+                f"Could not save settings:\n\n{exc}",
+            )
+
+    # ------------------------------------------------------------------
+
+    def validate_float(self, widget, name):
+        text = widget.text().strip()
+
+        try:
+            return float(text)
+
+        except ValueError:
+            raise ValueError(
+                f"{name} must be a valid number."
+            )
+
+    # ------------------------------------------------------------------
+
+    def validate_inputs(self):
+        try:
+            # ==========================================================
+            # CH1
+            # ==========================================================
+
+            delay1 = self.validate_float(
+                self.delay1_entry,
+                "Channel 1 delay",
+            )
+
+            if delay1 < 0:
+                raise ValueError(
+                    "Channel 1 delay must be >= 0."
+                )
+
+            if self.enable_ch1.isChecked():
+
+                if self.use_shaping.isChecked():
+                    pulse_length1 = 0.0
+                    voltage_high1 = 0.0
+
+                else:
+                    # Read CURRENT GUI values.
+                    pulse_length1 = self.validate_float(
+                        self.pulse_length1_entry,
+                        "Channel 1 pulse length",
+                    )
+
+                    voltage_high1 = self.validate_float(
+                        self.voltage_high1_entry,
+                        "Channel 1 voltage high",
+                    )
+
+                    if pulse_length1 <= 0:
+                        raise ValueError(
+                            "Channel 1 pulse length must be > 0."
+                        )
+
+                    if voltage_high1 <= 0:
+                        raise ValueError(
+                            "Channel 1 voltage high must be > 0."
+                        )
+
+            else:
+                pulse_length1 = 0.0
+                voltage_high1 = 0.0
+
+            # ==========================================================
+            # CH2
+            # ==========================================================
+
+            if self.enable_ch2.isChecked():
+
+                # Read CURRENT GUI values.
+                pulse_length2 = self.validate_float(
+                    self.pulse_length2_entry,
+                    "Channel 2 pulse length",
+                )
+
+                voltage_high2 = self.validate_float(
+                    self.voltage_high2_entry,
+                    "Channel 2 voltage high",
+                )
+
+                delay2 = self.validate_float(
+                    self.delay2_entry,
+                    "Channel 2 delay",
+                )
+
+                if pulse_length2 <= 0:
+                    raise ValueError(
+                        "Channel 2 pulse length must be > 0."
+                    )
+
+                if voltage_high2 <= 0:
+                    raise ValueError(
+                        "Channel 2 voltage high must be > 0."
+                    )
+
+                if delay2 < 0:
+                    raise ValueError(
+                        "Channel 2 delay must be >= 0."
+                    )
+
+            else:
+                pulse_length2 = 0.0
+                voltage_high2 = 0.0
+                delay2 = 0.0
+
+            return {
+                "pulse_length1": pulse_length1,
+                "voltage_high1": voltage_high1,
+                "delay1": delay1,
+                "pulse_length2": pulse_length2,
+                "voltage_high2": voltage_high2,
+                "delay2": delay2,
+            }
+
+        except ValueError as exc:
+            QMessageBox.critical(
+                self,
+                "Invalid Input",
+                str(exc),
+            )
+
+            return None
+
+    # ------------------------------------------------------------------
+
+    def read_shaping_parameters(self):
+        try:
+            v1 = float(
+                self.shaping_v1
+            )
+
+            t1 = float(
+                self.shaping_t1
+            )
+
+            v2 = float(
+                self.shaping_v2
+            )
+
+            t2 = float(
+                self.shaping_t2
+            )
+
+            if v1 < 0 or v2 < 0:
+                raise ValueError(
+                    "Shaping voltages must be >= 0."
+                )
+
+            if t1 <= 0:
+                raise ValueError(
+                    "T1 must be > 0."
+                )
+
+            if t2 <= 0:
+                raise ValueError(
+                    "T2 must be > 0."
+                )
+
+            return v1, t1, v2, t2
+
+        except (TypeError, ValueError) as exc:
+            QMessageBox.critical(
+                self,
+                "Invalid Shaping Parameters",
+                str(exc),
+            )
+
+            return None
+
+    # ------------------------------------------------------------------
+
+    def melt(self, quiet_offline=False):
+        """
+        Program TG5012A using CURRENT GUI values.
+
+        The hardware API calls follow the original USMELT code.
+
+        ``quiet_offline``: set by the right-click-on-canvas path so
+        that offline mode silently skips the pulse instead of popping
+        up an information dialog on every click.
+        """
+
+        if self.offline:
+            # Should not normally happen (button is disabled), but
+            # guard against keyboard activation or programmatic use.
+            if quiet_offline:
+                return
+            QMessageBox.information(
+                self,
+                "Offline mode",
+                "The application was started with --offline, "
+                "so no pulse generator is connected and melting "
+                "is disabled.",
+            )
+            return
+
+        if self.pg is None:
+            QMessageBox.critical(
+                self,
+                "Device Error",
+                "Pulse generator not initialized.",
+            )
+            return
+
+        ch1_params, ch2_params = (
+            None,
+            None,
+        )
+
+        params = self.validate_inputs()
+
+        if params is None:
+            return
+
+        pulse_length1 = params[
+            "pulse_length1"
+        ]
+
+        voltage_high1 = params[
+            "voltage_high1"
+        ]
+
+        delay1 = params[
+            "delay1"
+        ]
+
+        pulse_length2 = params[
+            "pulse_length2"
+        ]
+
+        voltage_high2 = params[
+            "voltage_high2"
+        ]
+
+        delay2 = params[
+            "delay2"
+        ]
+
+        try:
+            # ==========================================================
+            # CHANNEL 1
+            # ==========================================================
+
+            if self.enable_ch1.isChecked():
+
+                if self.use_shaping.isChecked():
+
+                    shaping = (
+                        self.read_shaping_parameters()
+                    )
+
+                    if shaping is None:
+                        return
+
+                    v1, t1, v2, t2 = shaping
+
+                    t_tail = 10.0
+
+                    t_total = (
+                        delay1
+                        + t1
+                        + t2
+                        + t_tail
+                    )
+
+                    num_points = 10000
+
+                    n_delay = int(
+                        round(
+                            num_points
+                            * delay1
+                            / t_total
+                        )
+                    )
+
+                    n_t1 = int(
+                        round(
+                            num_points
+                            * t1
+                            / t_total
+                        )
+                    )
+
+                    n_t2 = int(
+                        round(
+                            num_points
+                            * t2
+                            / t_total
+                        )
+                    )
+
+                    n_tail = (
+                        num_points
+                        - n_delay
+                        - n_t1
+                        - n_t2
+                    )
+
+                    # Keep the original waveform construction.
+                    voltages = (
+                        [0.0]
+                        + [0.0] * n_delay
+                        + [v1] * n_t1
+                        + [v2] * n_t2
+                        + [0.0] * n_tail
+                    )
+
+                    vmin = min(
+                        0.0,
+                        v1,
+                        v2,
+                    )
+
+                    vmax = max(
+                        0.0,
+                        v1,
+                        v2,
+                    )
+
+                    vpp = vmax - vmin
+
+                    if vpp < 0.01:
+                        vpp = 0.01
+
+                    voffset = (
+                        vmax + vmin
+                    ) / 2.0
+
+                    # Scale to 14-bit.
+                    points = []
+
+                    for v in voltages:
+                        y = int(
+                            round(
+                                (2**14 - 1)
+                                * (
+                                    v / vpp
+                                )
+                            )
+                        )
+
+                        y = max(
+                            0,
+                            min(
+                                2**14 - 1,
+                                y,
+                            ),
+                        )
+
+                        points.append(y)
+
+                    print(
+                        f"CH1 (Shaping): "
+                        f"V1: {v1}V for {t1}us, "
+                        f"V2: {v2}V for {t2}us, "
+                        f"Delay: {delay1}us, "
+                        f"Vpp: {vpp:.3f}V, "
+                        f"Voffset: {voffset:.3f}V"
+                    )
+
+                    # Original TG5012A programming.
+                    self.pg.channel(1)
+                    self.pg.output_load(50)
+
+                    self.pg.upload_arb(
+                        "ARB1",
+                        points,
+                        interpolation="OFF",
+                    )
+
+                    self.pg.set(
+                        "ARBLOAD",
+                        "ARB1",
+                    )
+
+                    self.pg.wave(
+                        "ARB"
+                    )
+
+                    self.pg.offset(
+                        voffset
+                    )
+
+                    self.pg.amplitude(
+                        vpp
+                    )
+
+                    self.pg.period(
+                        t_total * 1e-6
+                    )
+
+                    self.pg.burst(
+                        "NCYC"
+                    )
+
+                    self.pg.burst_count(1)
+
+                    self.pg.trigger_src(
+                        "MAN"
+                    )
+
+                    self.pg.output(
+                        "ON"
+                    )
+
+                else:
+                    # --------------------------------------------------
+                    # STANDARD CH1
+                    #
+                    # These values are read immediately from the
+                    # current GUI contents by validate_inputs().
+                    # --------------------------------------------------
+
+                    print(
+                        f"CH1: "
+                        f"Pulse: {pulse_length1}us, "
+                        f"Voltage: {voltage_high1}V, "
+                        f"Delay: {delay1}us"
+                    )
+
+                    self.pg.channel(1)
+                    self.pg.output_load(50)
+                    self.pg.wave("PULSE")
+                    self.pg.burst("NCYC")
+                    self.pg.burst_count(1)
+                    self.pg.trigger_src("MAN")
+
+                    self.pg.pulse_width(
+                        pulse_length1 * 1e-6
+                    )
+
+                    # The order between low and high matters.
+                    self.pg.low(0.0)
+
+                    self.pg.high(
+                        voltage_high1
+                    )
+
+                    self.pg.pulse_delay(
+                        delay1 * 1e-6
+                    )
+
+                    self.pg.output("ON")
+
+            else:
+                self.pg.channel(1)
+                self.pg.output("OFF")
+
+            # ==========================================================
+            # CHANNEL 2
+            # ==========================================================
+
+            if self.enable_ch2.isChecked():
+
+                print(
+                    f"CH2: "
+                    f"Pulse: {pulse_length2}us, "
+                    f"Voltage: {voltage_high2}V, "
+                    f"Delay: {delay2}us"
+                )
+
+                self.pg.channel(2)
+                self.pg.output_load(50)
+                self.pg.wave("PULSE")
+                self.pg.burst("NCYC")
+                self.pg.burst_count(1)
+                self.pg.trigger_src("CRC")
+
+                self.pg.pulse_width(
+                    pulse_length2 * 1e-6
+                )
+
+                # The order between low and high matters.
+                self.pg.low(0.0)
+
+                self.pg.high(
+                    voltage_high2
+                )
+
+                self.pg.pulse_delay(
+                    delay2 * 1e-6
+                )
+
+                self.pg.output("ON")
+
+            else:
+                self.pg.channel(2)
+                self.pg.output("OFF")
+
+            # ==========================================================
+            # SOUND + TRIGGER
+            # ==========================================================
+
+            if (
+                self.enable_ch1.isChecked()
+                or self.enable_ch2.isChecked()
+            ):
+
+                if self.melt_sound:
+                    sound_effect_path = (
+                        Path(__file__).parent
+                        / "sounds"
+                        / "short-laser-sfx.wav"
+                    )
+
+                    # Play asynchronously (SND_ASYNC) so the ~1 s wav
+                    # file does NOT block the thread.  Previously this
+                    # call blocked until the sound finished, delaying
+                    # the *TRG command -- and therefore the actual
+                    # output pulse -- by the full length of the clip.
+                    winsound.PlaySound(
+                        str(sound_effect_path),
+                        winsound.SND_FILENAME
+                        | winsound.SND_ASYNC,
+                    )
+
+                self.pg.channel(1)
+
+                self.pg.trigger()
+
+                # Disable both outputs after the pulse.
+                self.pg.channel(1)
+                self.pg.output("OFF")
+
+                self.pg.channel(2)
+                self.pg.output("OFF")
+
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Melt Error",
+                f"Could not execute melt:\n\n{exc}",
+            )
+
+            try:
+                if self.pg is not None:
+                    self.pg.channel(1)
+                    self.pg.output("OFF")
+
+                    self.pg.channel(2)
+                    self.pg.output("OFF")
+
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+
+    def open_shaping_dialog(self):
+        dialog = QDialog(
+            self
+        )
+
+        dialog.setWindowTitle(
+            "Pulse Shaping"
+        )
+
+        dialog.setModal(True)
+
+        layout = QVBoxLayout(
+            dialog
+        )
+
+        content = QHBoxLayout()
+
+        # --------------------------------------------------------------
+        # Parameters
+        # --------------------------------------------------------------
+
+        parameter_group = QGroupBox(
+            "Pulse Parameters"
+        )
+
+        form = QFormLayout(
+            parameter_group
+        )
+
+        v1_entry = QLineEdit(
+            str(self.shaping_v1)
+        )
+
+        t1_entry = QLineEdit(
+            str(self.shaping_t1)
+        )
+
+        v2_entry = QLineEdit(
+            str(self.shaping_v2)
+        )
+
+        t2_entry = QLineEdit(
+            str(self.shaping_t2)
+        )
+
+        form.addRow(
+            "V1 (V)",
+            v1_entry,
+        )
+
+        form.addRow(
+            "T1 (us)",
+            t1_entry,
+        )
+
+        form.addRow(
+            "V2 (V)",
+            v2_entry,
+        )
+
+        form.addRow(
+            "T2 (us)",
+            t2_entry,
+        )
+
+        content.addWidget(
+            parameter_group
+        )
+
+        # --------------------------------------------------------------
+        # Preview
+        # --------------------------------------------------------------
+
+        preview_group = QGroupBox(
+            "Waveform Preview"
+        )
+
+        preview_layout = QVBoxLayout(
+            preview_group
+        )
+
+        preview = WaveformPreview()
+
+        preview_layout.addWidget(
+            preview
+        )
+
+        content.addWidget(
+            preview_group
+        )
+
+        layout.addLayout(
+            content
+        )
+
+        # --------------------------------------------------------------
+        # Live preview
+        # --------------------------------------------------------------
+
+        def update_preview():
+            try:
+                v1 = float(
+                    v1_entry.text()
+                )
+
+                t1 = float(
+                    t1_entry.text()
+                )
+
+                v2 = float(
+                    v2_entry.text()
+                )
+
+                t2 = float(
+                    t2_entry.text()
+                )
+
+            except ValueError:
+                return
+
+            delay = 0.0
+
+            try:
+                delay = float(
+                    self.delay1_entry.text()
+                )
+
+            except ValueError:
+                pass
+
+            preview.set_values(
+                v1,
+                t1,
+                v2,
+                t2,
+                delay,
+            )
+
+        v1_entry.textChanged.connect(
+            update_preview
+        )
+
+        t1_entry.textChanged.connect(
+            update_preview
+        )
+
+        v2_entry.textChanged.connect(
+            update_preview
+        )
+
+        t2_entry.textChanged.connect(
+            update_preview
+        )
+
+        self.delay1_entry.textChanged.connect(
+            update_preview
+        )
+
+        update_preview()
+
+        # --------------------------------------------------------------
+        # Buttons
+        # --------------------------------------------------------------
+
+        buttons = QHBoxLayout()
+
+        ok_button = QPushButton(
+            "OK"
+        )
+
+        cancel_button = QPushButton(
+            "Cancel"
+        )
+
+        buttons.addStretch()
+
+        buttons.addWidget(
+            ok_button
+        )
+
+        buttons.addWidget(
+            cancel_button
+        )
+
+        layout.addLayout(
+            buttons
+        )
+
+        def accept():
+            try:
+                v1 = float(
+                    v1_entry.text()
+                )
+
+                t1 = float(
+                    t1_entry.text()
+                )
+
+                v2 = float(
+                    v2_entry.text()
+                )
+
+                t2 = float(
+                    t2_entry.text()
+                )
+
+                if v1 < 0 or v2 < 0:
+                    raise ValueError(
+                        "Voltages must be >= 0."
+                    )
+
+                if t1 <= 0:
+                    raise ValueError(
+                        "T1 must be greater than 0."
+                    )
+
+                if t2 <= 0:
+                    raise ValueError(
+                        "T2 must be greater than 0."
+                    )
+
+            except ValueError as exc:
+                QMessageBox.critical(
+                    dialog,
+                    "Invalid Input",
+                    str(exc),
+                )
+
+                return
+
+            self.shaping_v1 = v1
+            self.shaping_t1 = t1
+            self.shaping_v2 = v2
+            self.shaping_t2 = t2
+
+            self.save_settings()
+
+            # Shaping voltages feed the marker color scale when
+            # shaping is active — refresh the status/colors.
+            self.effective_voltage_changed.emit()
+
+            dialog.accept()
+
+        ok_button.clicked.connect(
+            accept
+        )
+
+        cancel_button.clicked.connect(
+            dialog.reject
+        )
+
+        dialog.resize(
+            850,
+            350,
+        )
+
+        dialog.exec()
+
+    # ------------------------------------------------------------------
+
+    def set_device(self):
+        """
+        Original USMELT Set Device behavior.
+        """
+
+        if self.offline:
+            QMessageBox.information(
+                self,
+                "Offline mode",
+                "Device connections are disabled because the "
+                "application was started with --offline.",
+            )
+            return
+
+        serial_port, ok = QInputDialog.getText(
+            self,
+            "Set Device",
+            "Enter device name:",
+            text=self.device_name,
+        )
+
+        if not ok:
+            return
+
+        new_device = serial_port.strip()
+
+        if not new_device:
+            return
+
+        self.device_name = new_device
+
+        # Release the previous connection (if any) *before* opening a
+        # new one; otherwise the old COM port handle stays open and
+        # Windows reports "Access is denied" the next time it is used.
+        self.close_pg()
+
+        try:
+            self.pg = usmelt.TG5012A(
+                serial_port=self.device_name
+            )
+
+            self.init_pg()
+
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Device Error",
+                f"Could not connect to device: {exc}",
+            )
+
+            self.pg = None
+
+    # ------------------------------------------------------------------
+
+    def close_pg(self):
+        """Close the pulse generator connection and release the port."""
+        pg = getattr(self, "pg", None)
+        if pg is not None:
+            try:
+                pg.close()
+            except Exception:
+                pass
+        self.pg = None
+
+
+# ----------------------------------------------------------------------
+# Main Image Marker application
+# ----------------------------------------------------------------------
+
+class ImageMarkerApp(QMainWindow):
+    def __init__(self, offline=None):
+        super().__init__()
+
+        # Resolve offline mode: explicit argument wins, otherwise
+        # fall back to the module-level flag set from argv.
+        if offline is None:
+            offline = OFFLINE_MODE
+
+        self.offline = bool(offline)
+
+        self.setWindowTitle(
+            "USMELT + Image Marker (offline)"
+            if self.offline
+            else "USMELT + Image Marker"
+        )
+
+        self.resize(
+            1500,
+            900,
+        )
+
+        self.markers = []
+
+        self.undo_stack = []
+        self.redo_stack = []
+
+        self.marker_size = 40
+
+        self.color_min = 1.0
+        self.color_max = 2.0
+
+        self.current_voltage = None
+        self.current_is_test = False
+
+        # Marking session bookkeeping (see save_session / load_session).
+        self.session_path = None
+        self._session_dirty = False
+
+        # Set to True as soon as a session file is successfully loaded
+        # so the autosave can be dropped on a clean exit; while it is
+        # set, _load_image_file() will NOT overwrite the autosave with
+        # an empty state when re-opening the session's image.
+        self._session_loaded_ok = False
+
+        self.build_menu()
+        self.build_ui()
+
+        # Track toolbar edits so the window title can show the "*"
+        # unsaved marker and Save Session can ask before discarding.
+        for edit in self.shape_descriptions.values():
+            edit.textEdited.connect(self._mark_session_dirty)
+
+        self.marker_size_slider.valueChanged.connect(
+            self._mark_session_dirty
+        )
+        self.color_min_spin.valueChanged.connect(
+            self._mark_session_dirty
+        )
+        self.color_max_spin.valueChanged.connect(
+            self._mark_session_dirty
+        )
+        self.rotation_spin.valueChanged.connect(
+            self._mark_session_dirty
+        )
+        self.shape_button_group.buttonClicked.connect(
+            self._mark_session_dirty
+        )
+
+    # ------------------------------------------------------------------
+
+    def _base_window_title(self):
+        if self.offline:
+            return "USMELT + Image Marker (offline)"
+
+        return "USMELT + Image Marker"
+
+    # ------------------------------------------------------------------
+
+    def update_window_title(self):
+        """Reflect the current session file and unsaved changes."""
+        title = self._base_window_title()
+
+        if self.session_path:
+            title += f" — {Path(self.session_path).name}"
+
+        if self._session_dirty:
+            title += " *"
+
+        self.setWindowTitle(title)
+
+    # ------------------------------------------------------------------
+
+    def _mark_session_dirty(self, *args):
+        if not self._session_dirty:
+            self._session_dirty = True
+            self.update_window_title()
+
+    # ------------------------------------------------------------------
+
+    def _on_marker_list_changed(self):
+        """Bookkeeping hook called after every marker placement or
+        removal (add / undo / redo / clear).
+
+        Flags the session as modified and mirrors it to the single
+        background autosave file so a crash loses at most the action
+        that triggered this call.
+        """
+        self._mark_session_dirty()
+        self.autosave_session()
+
+    # ------------------------------------------------------------------
+    # Autosave (crash protection)
+    #
+    # The session is mirrored to a single background file every time a
+    # marker is placed or removed, so an unexpected crash loses at most
+    # the action that triggered it.  See AUTOSAVE_DIRNAME /
+    # AUTOSAVE_FILE_NAME above for where the file lives.
+    # ------------------------------------------------------------------
+
+    def _autosave_path(self):
+        return _autosave_dir() / AUTOSAVE_FILE_NAME
+
+    # ------------------------------------------------------------------
+
+    def autosave_session(self):
+        """Silently mirror the current session to the autosave file.
+
+        Never raises and never shows dialogs — it runs in the
+        background after every marker placement/removal.  There is
+        only ever one autosave file: each call overwrites the
+        previous snapshot (opening a new image counts as starting a
+        new session and simply replaces the old autosave too).
+        """
+        # While a session file is being restored we must not overwrite
+        # the autosave with half-applied state; load_session triggers
+        # an explicit autosave once everything is in place.
+        if getattr(self, "_loading_session", False):
+            return False
+
+        # Nothing open yet -> nothing worth protecting.
+        if self.canvas.base_image is None:
+            return False
+
+        path = self._autosave_path()
+
+        data = self.build_session_data()
+
+        # Provenance markers so startup can tell an autosave apart
+        # from a regular session file.  Older readers ignore unknown
+        # keys, so this stays backward compatible.
+        data["autosave"] = True
+        data["autosave_of"] = (
+            str(self.session_path) if self.session_path else None
+        )
+
+        try:
+            # Written atomically (temp file + rename): a crash during
+            # the write itself can never leave a half-written autosave
+            # behind.
+            _write_json_atomically(
+                path,
+                data,
+            )
+
+        except OSError:
+            # Disk full, permissions, ... — autosave is best-effort;
+            # never interrupt the user's work over it.
+            return False
+
+        self._autosave_available = True
+
+        return True
+
+    # ------------------------------------------------------------------
+
+    def discard_autosave(self):
+        """Remove the autosave file (clean exits / recovered sessions)."""
+        try:
+            self._autosave_path().unlink(missing_ok=True)
+
+        except OSError:
+            pass
+
+    # ------------------------------------------------------------------
+
+    def maybe_restore_autosave_on_startup(self):
+        """Offer to reopen the last auto-saved session on startup.
+
+        Returns True when the autosave was restored into the window.
+        Silently drops autosaves whose image no longer exists (e.g.
+        files coming from another computer), so the prompt only ever
+        appears for sessions that can actually be resumed.
+        """
+        path = self._autosave_path()
+
+        if not path.is_file():
+            return False
+
+        try:
+            with open(
+                path,
+                "r",
+                encoding="utf-8",
+            ) as handle:
+                data = json.load(handle)
+
+        except (OSError, ValueError):
+            # Corrupted autosave (shouldn't happen thanks to the
+            # atomic write, but a manually edited file could): get rid
+            # of it and start fresh.
+            self.discard_autosave()
+
+            return False
+
+        if (
+            not isinstance(data, dict)
+            or "markers" not in data
+        ):
+            self.discard_autosave()
+
+            return False
+
+        image_path = (data.get("image") or {}).get("path")
+
+        if not image_path or not os.path.isfile(str(image_path)):
+            # The referenced image is gone (moved/renamed or saved on
+            # another machine) — nothing sensible to restore.
+            self.discard_autosave()
+
+            return False
+
+        marker_count = len(data.get("markers") or [])
+
+        answer = QMessageBox.question(
+            self,
+            "Restore Autosaved Session?",
+            "USMARK found an auto-saved session from "
+            f"{self._format_saved_age(data.get('saved_at'))}:\n\n"
+            f"Image: {Path(image_path).name}\n"
+            f"Markers: {marker_count}\n\n"
+            "Would you like to resume where you left off?\n\n"
+            "(Choosing No starts with a blank slate; the autosave "
+            "file will be kept until your next marker placement "
+            "overwrites it.)",
+            QMessageBox.Yes
+            | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+
+        if answer != QMessageBox.Yes:
+            return False
+
+        if not self.load_session(path):
+            return False
+
+        # Keep the recovered snapshot around until the next real change
+        # overwrites it, so quitting right after recovery still leaves
+        # the same recoverable state.
+        self.autosave_session()
+
+        return True
+
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _format_saved_age(saved_at):
+        """Human-readable 'how long ago' for the autosave timestamp."""
+        try:
+            saved = datetime.fromisoformat(str(saved_at))
+
+            seconds = max(
+                0,
+                int((datetime.now() - saved).total_seconds()),
+            )
+
+        except (TypeError, ValueError):
+            return "an earlier run"
+
+        if seconds < 90:
+            return "just now"
+
+        minutes = seconds // 60
+
+        if minutes < 60:
+            return f"about {minutes} min ago"
+
+        hours = minutes // 60
+
+        if hours < 24:
+            return f"about {hours} h ago"
+
+        return f"on {saved.strftime('%Y-%m-%d')}"
+
+    # ------------------------------------------------------------------
+
+    def build_menu(self):
+        session_menu = (
+            self.menuBar().addMenu(
+                "Session"
+            )
+        )
+
+        save_session_action = QAction(
+            "Save Session…",
+            self,
+        )
+
+        save_session_action.setShortcut("Ctrl+S")
+        save_session_action.setStatusTip(
+            "Save image path, markers and toolbar settings to a "
+            ".usmark.json session file"
+        )
+
+        save_session_action.triggered.connect(
+            lambda checked=False: self.save_session()
+        )
+
+        session_menu.addAction(
+            save_session_action
+        )
+
+        load_session_action = QAction(
+            "Load Session…",
+            self,
+        )
+
+        load_session_action.setShortcut("Ctrl+O")
+        load_session_action.setStatusTip(
+            "Restore a previously saved marking session"
+        )
+
+        load_session_action.triggered.connect(
+            lambda checked=False: self.load_session_dialog()
+        )
+
+        session_menu.addAction(
+            load_session_action
+        )
+
+        settings_menu = (
+            self.menuBar().addMenu(
+                "Settings"
+            )
+        )
+
+        set_device_action = QAction(
+            "Set Device",
+            self,
+        )
+
+        set_device_action.triggered.connect(
+            self.set_device
+        )
+
+        settings_menu.addAction(
+            set_device_action
+        )
+
+        self.melt_sound_action = QAction(
+            "Melt sound",
+            self,
+        )
+
+        self.melt_sound_action.setCheckable(
+            True
+        )
+
+        settings_menu.addAction(
+            self.melt_sound_action
+        )
+
+        settings_menu.addSeparator()
+
+        exit_action = QAction(
+            "Exit",
+            self,
+        )
+
+        exit_action.triggered.connect(
+            self.close
+        )
+
+        settings_menu.addAction(
+            exit_action
+        )
+
+    # ------------------------------------------------------------------
+
+    def build_ui(self):
+        central = QWidget()
+
+        self.setCentralWidget(
+            central
+        )
+
+        main_layout = QHBoxLayout(
+            central
+        )
+
+        main_layout.setContentsMargins(
+            6,
+            6,
+            6,
+            6,
+        )
+
+        # ==============================================================
+        # LEFT TASK BAR
+        # ==============================================================
+
+        scroll = QScrollArea()
+
+        scroll.setWidgetResizable(
+            True
+        )
+
+        scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarAlwaysOff
+        )
+
+        scroll.setFixedWidth(
+            400
+        )
+
+        left_widget = QWidget()
+
+        left_layout = QVBoxLayout(
+            left_widget
+        )
+
+        left_layout.setAlignment(
+            Qt.AlignTop
+        )
+
+        scroll.setWidget(
+            left_widget
+        )
+
+        # --------------------------------------------------------------
+        # USMELT
+        # --------------------------------------------------------------
+
+        self.melter = MelterPanel(
+            offline=self.offline
+        )
+
+        left_layout.addWidget(
+            self.melter
+        )
+
+        if self.offline:
+            # Grey out the Settings / "Set Device" menu entry, since
+            # no device connection can be made in offline mode.
+            for action in self.menuBar().actions():
+                if action.text() == "Settings":
+                    for act in action.menu().actions():
+                        if act.text() == "Set Device":
+                            act.setEnabled(False)
+                            break
+                    break
+
+        self.melt_sound_action.setChecked(
+            self.melter.melt_sound
+        )
+
+        self.melt_sound_action.toggled.connect(
+            self.on_melt_sound_toggled
+        )
+
+        # --------------------------------------------------------------
+        # MARKER CONTROLS
+        # --------------------------------------------------------------
+
+        marker_group = QGroupBox(
+            "Image Marking"
+        )
+
+        marker_layout = QVBoxLayout(
+            marker_group
+        )
+
+        open_button = QPushButton(
+            "Open Image"
+        )
+
+        open_button.clicked.connect(
+            self.open_image
+        )
+
+        marker_layout.addWidget(
+            open_button
+        )
+
+        # Marker size.
+        size_row = QHBoxLayout()
+
+        size_row.addWidget(
+            QLabel("Marker Size")
+        )
+
+        self.marker_size_slider = QSlider(
+            Qt.Horizontal
+        )
+
+        self.marker_size_slider.setMinimum(
+            2
+        )
+
+        self.marker_size_slider.setMaximum(
+            100
+        )
+
+        self.marker_size_slider.setValue(
+            40
+        )
+
+        self.marker_size_slider.valueChanged.connect(
+            self.marker_size_changed
+        )
+
+        self.marker_size_label = QLabel(
+            "40 px"
+        )
+
+        self.marker_size_label.setFixedWidth(
+            45
+        )
+
+        size_row.addWidget(
+            self.marker_size_slider
+        )
+
+        size_row.addWidget(
+            self.marker_size_label
+        )
+
+        marker_layout.addLayout(
+            size_row
+        )
+
+        # --------------------------------------------------------------
+        # Marker shapes
+        #
+        # One row per shape in the left tool bar: selection bubble
+        # (radio button), a drawn preview of the shape, and a text
+        # box for a short description that appears in the exported
+        # figure legend when more than one shape is used.
+        # --------------------------------------------------------------
+
+        shape_group = QGroupBox(
+            "Marker Shapes"
+        )
+
+        shape_grid = QGridLayout(
+            shape_group
+        )
+
+        self.shape_buttons = {}
+        self.shape_descriptions = {}
+
+        self.shape_button_group = QButtonGroup(
+            self
+        )
+
+        self.shape_button_group.setExclusive(
+            True
+        )
+
+        for row_index, shape_name in enumerate(MARKER_SHAPES):
+            radio = QRadioButton()
+
+            radio.setToolTip(
+                f"Place new markers as a {shape_name}."
+            )
+
+            self.shape_button_group.addButton(
+                radio
+            )
+
+            self.shape_buttons[shape_name] = radio
+
+            icon = ShapeIconWidget(
+                shape_name
+            )
+
+            desc_edit = QLineEdit()
+
+            desc_edit.setPlaceholderText(
+                f"Description for {shape_name} markers…"
+            )
+
+            desc_edit.setToolTip(
+                "Short label shown next to this shape in the "
+                "exported figure legend (used when multiple "
+                "shapes appear on the image)."
+            )
+
+            self.shape_descriptions[shape_name] = desc_edit
+
+            shape_grid.addWidget(
+                radio,
+                row_index,
+                0,
+            )
+
+            shape_grid.addWidget(
+                icon,
+                row_index,
+                1,
+            )
+
+            shape_grid.addWidget(
+                desc_edit,
+                row_index,
+                2,
+            )
+
+        shape_grid.setColumnStretch(
+            2,
+            1,
+        )
+
+        # Circle is the default shape.
+        self.shape_buttons["circle"].setChecked(
+            True
+        )
+
+        self.current_shape = "circle"
+
+        self.shape_button_group.buttonClicked.connect(
+            self._on_shape_selected
+        )
+
+        marker_layout.addWidget(
+            shape_group
+        )
+
+        # --------------------------------------------------------------
+        # Voltage / Test status
+        # --------------------------------------------------------------
+
+        voltage_row = QHBoxLayout()
+
+        self.voltage_status_label = QLabel(
+            "Voltage: —"
+        )
+
+        self.test_checkbox = QCheckBox(
+            "Test"
+        )
+
+        self.test_checkbox.setEnabled(
+            False
+        )
+
+        self.test_checkbox.setToolTip(
+            "Automatically active when Channel 1 "
+            "Voltage High is exactly 5.0 V."
+        )
+
+        voltage_row.addWidget(
+            self.voltage_status_label
+        )
+
+        voltage_row.addStretch()
+
+        voltage_row.addWidget(
+            self.test_checkbox
+        )
+
+        marker_layout.addLayout(
+            voltage_row
+        )
+
+        # --------------------------------------------------------------
+        # Color scale
+        # --------------------------------------------------------------
+
+        color_group = QGroupBox(
+            "Voltage Color Scale"
+        )
+
+        color_layout = QGridLayout(
+            color_group
+        )
+
+        self.color_min_spin = QDoubleSpinBox()
+
+        self.color_min_spin.setRange(
+            0.0,
+            100.0,
+        )
+
+        self.color_min_spin.setDecimals(
+            2
+        )
+
+        self.color_min_spin.setSingleStep(
+            0.05
+        )
+
+        self.color_min_spin.setValue(
+            self.color_min
+        )
+
+        self.color_max_spin = QDoubleSpinBox()
+
+        self.color_max_spin.setRange(
+            0.0,
+            100.0,
+        )
+
+        self.color_max_spin.setDecimals(
+            2
+        )
+
+        self.color_max_spin.setSingleStep(
+            0.05
+        )
+
+        self.color_max_spin.setValue(
+            self.color_max
+        )
+
+        self.color_min_spin.valueChanged.connect(
+            self.color_range_changed
+        )
+
+        self.color_max_spin.valueChanged.connect(
+            self.color_range_changed
+        )
+
+        color_layout.addWidget(
+            QLabel("Min"),
+            0,
+            0,
+        )
+
+        color_layout.addWidget(
+            self.color_min_spin,
+            0,
+            1,
+        )
+
+        color_layout.addWidget(
+            QLabel("Max"),
+            1,
+            0,
+        )
+
+        color_layout.addWidget(
+            self.color_max_spin,
+            1,
+            1,
+        )
+
+        marker_layout.addWidget(
+            color_group
+        )
+
+        # --------------------------------------------------------------
+        # Rotation
+        # --------------------------------------------------------------
+
+        self.rotation_group = QGroupBox(
+            "Rotation"
+        )
+
+        rotation_layout = QGridLayout(
+            self.rotation_group
+        )
+
+        self.rotation_spin = QDoubleSpinBox()
+
+        self.rotation_spin.setRange(
+            -360.0,
+            360.0,
+        )
+
+        self.rotation_spin.setDecimals(
+            2
+        )
+
+        self.rotation_spin.setSingleStep(
+            1.0
+        )
+
+        self.rotation_spin.setValue(
+            0.0
+        )
+
+        self.rotation_spin.valueChanged.connect(
+            self.rotation_changed
+        )
+
+        rotation_layout.addWidget(
+            QLabel("Angle"),
+            0,
+            0,
+        )
+
+        rotation_layout.addWidget(
+            self.rotation_spin,
+            0,
+            1,
+        )
+
+        self.reset_rotation_button = QPushButton(
+            "Reset Rotation"
+        )
+
+        self.reset_rotation_button.clicked.connect(
+            self.reset_rotation
+        )
+
+        rotation_layout.addWidget(
+            self.reset_rotation_button,
+            1,
+            0,
+            1,
+            2,
+        )
+
+        marker_layout.addWidget(
+            self.rotation_group
+        )
+
+        # --------------------------------------------------------------
+        # Guide (snap-to-mesh)
+        # --------------------------------------------------------------
+
+        guide_group = QGroupBox("Guide")
+        guide_layout = QVBoxLayout(guide_group)
+
+        self.guide_toggle_button = QPushButton("Enable Guide")
+        self.guide_toggle_button.setToolTip(
+            "Start 3-point mesh calibration (click S1 → S2 → Sn).\n"
+            "Disable: remove guide and restore normal image navigation."
+        )
+        self.guide_toggle_button.clicked.connect(self.toggle_guide)
+        guide_layout.addWidget(self.guide_toggle_button)
+
+        self.guide_apply_button = QPushButton("Accept Guide")
+        self.guide_apply_button.setToolTip(
+            "Lock the calculated mesh in place.\n"
+            "While applied, markers snap to the nearest mesh node."
+        )
+        self.guide_apply_button.setEnabled(False)
+        self.guide_apply_button.clicked.connect(self.accept_guide)
+        guide_layout.addWidget(self.guide_apply_button)
+
+        self.guide_retry_button = QPushButton("Retry")
+        self.guide_retry_button.setToolTip(
+            "Discard the calculated mesh and pick three new points."
+        )
+        self.guide_retry_button.setVisible(False)
+        self.guide_retry_button.clicked.connect(self.retry_guide)
+        guide_layout.addWidget(self.guide_retry_button)
+
+        marker_layout.addWidget(guide_group)
+
+        # --------------------------------------------------------------
+        # Undo / Redo / Clear
+        # --------------------------------------------------------------
+
+        history_row = QHBoxLayout()
+
+        undo_button = QPushButton(
+            "Undo"
+        )
+
+        undo_button.clicked.connect(
+            self.undo
+        )
+
+        redo_button = QPushButton(
+            "Redo"
+        )
+
+        redo_button.clicked.connect(
+            self.redo
+        )
+
+        clear_button = QPushButton(
+            "Clear"
+        )
+
+        clear_button.clicked.connect(
+            self.clear_markers
+        )
+
+        history_row.addWidget(
+            undo_button
+        )
+
+        history_row.addWidget(
+            redo_button
+        )
+
+        history_row.addWidget(
+            clear_button
+        )
+
+        marker_layout.addLayout(
+            history_row
+        )
+
+        # --------------------------------------------------------------
+        # Export
+        # --------------------------------------------------------------
+
+        export_button = QPushButton(
+            "Export Annotated Image"
+        )
+
+        export_button.clicked.connect(
+            self.export_image
+        )
+
+        marker_layout.addWidget(
+            export_button
+        )
+
+        # --------------------------------------------------------------
+        # Marker counter (above Image Marking group)
+        #
+        # Format: "Exposures: N (+M)" where N is the number of real
+        # (non-test) markers and M is the number of "Test" markers
+        # (voltage = 5 V).  The main part is rendered with an enlarged
+        # font so it stands out; the "(+M)" suffix stays small.
+        # It is refreshed whenever markers are added / undone /
+        # cleared / loaded (update_marker_counter).
+        # --------------------------------------------------------------
+
+        self.marker_counter_label = QLabel(
+            self._marker_counter_html(0, 0)
+        )
+
+        self.marker_counter_label.setObjectName(
+            "markerCounterLabel"
+        )
+
+        self.marker_counter_label.setAlignment(
+            Qt.AlignCenter
+        )
+
+        # Rich text lets us enlarge only the important part while
+        # keeping the "(+M)" test-marker suffix visually subdued.
+        self.marker_counter_label.setTextFormat(
+            Qt.RichText
+        )
+
+        self.marker_counter_label.setStyleSheet(
+            "QLabel#markerCounterLabel {"
+            " padding: 6px;"
+            " border: 1px solid palette(mid);"
+            " background: palette(base);"
+            " font-weight: bold;"
+            " }"
+        )
+
+        self.marker_counter_label.setToolTip(
+            "N = number of exposures (markers excluding \"Test\"\n"
+            "markers at 5 V).  (+M) = test markers placed."
+        )
+
+        left_layout.addWidget(
+            self.marker_counter_label
+        )
+
+        left_layout.addWidget(
+            marker_group
+        )
+
+        # ==============================================================
+        # IMAGE CANVAS
+        # ==============================================================
+
+        self.canvas = ImageCanvas(
+            self
+        )
+
+        self.canvas.marker_added.connect(
+            self.add_marker
+        )
+
+        # Right-click on the image: remove the nearest marker.
+        self.canvas.marker_remove_requested.connect(
+            self.remove_nearest_marker
+        )
+
+        main_layout.addWidget(
+            scroll
+        )
+
+        main_layout.addWidget(
+            self.canvas,
+            1,
+        )
+
+        self.melter.voltage_high1_changed.connect(
+            self.update_marker_voltage_state
+        )
+
+        # Shaping toggles / shaping voltage changes also modify the
+        # effective CH1 voltage used for marker colors.
+        self.melter.effective_voltage_changed.connect(
+            self.update_marker_voltage_state
+        )
+
+        self.update_marker_voltage_state()
+
+        # Initial state of the non-test marker counter.
+        self.update_marker_counter()
+
+    # ------------------------------------------------------------------
+
+    def set_device(self):
+        self.melter.set_device()
+
+    # ------------------------------------------------------------------
+
+    def on_melt_sound_toggled(self, checked):
+        self.melter.melt_sound = checked
+        self.melter.save_settings()
+
+    # ------------------------------------------------------------------
+
+    def _on_shape_selected(self, button):
+        for name, btn in self.shape_buttons.items():
+            if btn is button:
+                self.current_shape = name
+                self._mark_session_dirty()
+                return
+
+    # ------------------------------------------------------------------
+
+    def get_current_voltage(self):
+        # Use the effective CH1 voltage (shaping-aware), not just
+        # whatever the Voltage High entry happens to contain.
+        return self.melter.get_effective_voltage_high1()
+
+    # ------------------------------------------------------------------
+
+    def update_marker_voltage_state(self):
+        voltage = self.get_current_voltage()
+
+        self.current_voltage = voltage
+
+        if voltage is None:
+            self.current_is_test = False
+
+            self.voltage_status_label.setText(
+                "Voltage: —"
+            )
+
+            self.test_checkbox.setChecked(
+                False
+            )
+
+            return
+
+        self.current_is_test = is_test_voltage(
+            voltage
+        )
+
+        self.voltage_status_label.setText(
+            f"Voltage: {voltage:.2f} V"
+            + (" (offline)" if getattr(self, "offline", False) else "")
+        )
+
+        self.test_checkbox.setChecked(
+            self.current_is_test
+        )
+
+        # Refresh marker rendering so the voltage/status shown in
+        # the panel always matches the colors of the markers.
+        if self.canvas.base_image is not None:
+            self.canvas.render_image()
+
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _marker_counter_html(non_test, test_count):
+        """Build the counter's rich-text string.
+
+        Layout:  "Exposures: N (+M)"
+
+        * ``N`` (real, non-test markers) is part of the main text and
+          is rendered with an enlarged font so it stands out from the
+          surrounding settings.
+        * ``(+M)`` (the "Test" markers at 5 V) is appended in a
+          smaller, subdued font; it is omitted entirely when there
+          are no test markers.
+        """
+        base_size = QFontMetrics(
+            QApplication.font()
+        ).height()
+
+        main_size = max(base_size + 6, int(base_size * 1.4))
+
+        html = (
+            f'<span style="font-size:{main_size}px;">'
+            f"Exposures: {non_test}"
+            f"</span>"
+        )
+
+        if test_count:
+            html += (
+                f' <span style="font-size:{base_size}px; '
+                f'color: palette(mid);">'
+                f"(+{test_count})"
+                f"</span>"
+            )
+
+        return html
+
+    # ------------------------------------------------------------------
+    # Guide mesh controls
+    # ------------------------------------------------------------------
+
+    def toggle_guide(self):
+        """Enable (start calibration) or disable the guide."""
+        if self.canvas.guide_mode == "off":
+            self.canvas.set_guide_mode("calibrating")
+        else:
+            self.canvas.set_guide_mode("off")
+        self._update_guide_ui()
+        self._mark_session_dirty()
+
+    def accept_guide(self):
+        """Lock the calculated mesh (preview → applied)."""
+        if self.canvas.guide_mode != "preview":
+            return
+        self.canvas.set_guide_mode("applied")
+        self._update_guide_ui()
+        self._mark_session_dirty()
+
+    def retry_guide(self):
+        """Discard calculated mesh and restart calibration."""
+        if self.canvas.guide_mode != "preview":
+            return
+        self.canvas.set_guide_mode("calibrating")
+        self._update_guide_ui()
+
+    def _update_guide_ui(self):
+        """Refresh button states based on current guide mode."""
+        mode = self.canvas.guide_mode
+        self.guide_toggle_button.setText(
+            "Enable Guide" if mode == "off" else "Disable Guide"
+        )
+        if mode == "preview":
+            self.guide_apply_button.setEnabled(True)
+            self.guide_retry_button.setVisible(True)
+        else:
+            self.guide_apply_button.setEnabled(False)
+            self.guide_retry_button.setVisible(False)
+
+    # ------------------------------------------------------------------
+
+    def update_marker_counter(self):
+        """Refresh the exposure counter in the left task bar.
+
+        Shows "Exposures: N (+M)" where N counts the real markers and
+        M counts the "Test" markers (the ones placed at a voltage of
+        5 V).  Everything except "(+M)" uses an enlarged font so the
+        important number is easy to spot.  The label lives at the
+        bottom of the left-side tool bar and is updated in real time
+        whenever the marker list changes (add / undo / redo / clear /
+        new image / load session).
+        """
+        if not hasattr(self, "marker_counter_label"):
+            return
+
+        total = len(self.markers)
+
+        non_test = count_real_markers(
+            self.markers
+        )
+
+        test_count = total - non_test
+
+        self.marker_counter_label.setText(
+            self._marker_counter_html(
+                non_test, test_count
+            )
+        )
+
+    # ------------------------------------------------------------------
+
+    def update_last_marker_flag(self):
+        """Keep exactly one marker flagged as 'last placed'.
+
+        The flag drives the GUI-only highlight ring (see
+        ImageCanvas.paintEvent) so an interrupted session can be
+        resumed at a glance.  It is stored in session files but never
+        drawn into exported images.
+
+        Callers must invoke this *before* handing the list to
+        canvas.set_markers() so the repaint shows the new state.
+        """
+        for marker in self.markers:
+            marker.is_last = False
+
+        if self.markers:
+            # The most recently placed marker is simply the last one
+            # in the list (markers are appended in placement order and
+            # undo/redo restore whole snapshots of that list).
+            self.markers[-1].is_last = True
+
+    # ------------------------------------------------------------------
+
+    def save_undo_state(self):
+        self.undo_stack.append(
+            copy.deepcopy(
+                self.markers
+            )
+        )
+
+        self.redo_stack.clear()
+
+        if len(self.undo_stack) > 100:
+            self.undo_stack.pop(0)
+
+    # ------------------------------------------------------------------
+
+    def add_marker(self, x, y):
+        voltage = self.get_current_voltage()
+
+        if voltage is None:
+            self.voltage_status_label.setText(
+                "Voltage: invalid CH1 value"
+            )
+
+            return
+
+        self.save_undo_state()
+
+        marker = Marker(
+            x=x,
+            y=y,
+            size=self.marker_size,
+            voltage=voltage,
+            is_test=is_test_voltage(
+                voltage
+            ),
+            shape=getattr(self, "current_shape", "circle"),
+        )
+
+        self.markers.append(
+            marker
+        )
+
+        self.update_last_marker_flag()
+
+        self.canvas.set_markers(
+            self.markers
+        )
+
+        self.update_marker_counter()
+
+        self._on_marker_list_changed()
+
+    # ------------------------------------------------------------------
+
+    def remove_nearest_marker(self, bx, by):
+        """Remove the marker closest to (bx, by) in base-image coordinates.
+
+        When the guide is applied the caller already snapped (bx, by) to
+        the nearest node, so the matching marker will be at distance ~0.
+        Without a guide the user clicks roughly on a marker; we remove
+        whatever is nearest (no distance threshold — undo is available).
+        """
+        if not self.markers:
+            return
+
+        import math as _math
+
+        best_idx = min(
+            range(len(self.markers)),
+            key=lambda i: _math.hypot(
+                self.markers[i].x - bx,
+                self.markers[i].y - by,
+            ),
+        )
+
+        self.save_undo_state()
+        self.markers.pop(best_idx)
+        self.update_last_marker_flag()
+        self.canvas.set_markers(self.markers)
+        self.update_marker_counter()
+        self._on_marker_list_changed()
+
+    # ------------------------------------------------------------------
+
+    def on_canvas_melt_requested(self):
+        """
+        Slot for ImageCanvas.melt_requested (right-click on the image).
+
+        Runs the same action as the "Melt" button. In offline mode the
+        melt is skipped silently (the marker placement already happened
+        via marker_added), so right-clicking just places a marker.
+        """
+        if self.offline:
+            return
+
+        self.melter.melt(quiet_offline=True)
+
+    # ------------------------------------------------------------------
+
+    def undo(self):
+        if not self.undo_stack:
+            return
+
+        self.redo_stack.append(
+            copy.deepcopy(
+                self.markers
+            )
+        )
+
+        self.markers = (
+            self.undo_stack.pop()
+        )
+
+        self.update_last_marker_flag()
+
+        self.canvas.set_markers(
+            self.markers
+        )
+
+        self.update_marker_counter()
+
+        self._on_marker_list_changed()
+
+    # ------------------------------------------------------------------
+
+    def redo(self):
+        if not self.redo_stack:
+            return
+
+        self.undo_stack.append(
+            copy.deepcopy(
+                self.markers
+            )
+        )
+
+        self.markers = (
+            self.redo_stack.pop()
+        )
+
+        self.update_last_marker_flag()
+
+        self.canvas.set_markers(
+            self.markers
+        )
+
+        self.update_marker_counter()
+
+        self._on_marker_list_changed()
+
+    # ------------------------------------------------------------------
+
+    def clear_markers(self):
+        if not self.markers:
+            return
+
+        self.save_undo_state()
+
+        self.markers = []
+
+        # Nothing left to highlight (empty list -> no flagged marker).
+        self.update_last_marker_flag()
+
+        self.canvas.set_markers(
+            self.markers
+        )
+
+        self.update_marker_counter()
+
+        self._on_marker_list_changed()
+
+    # ------------------------------------------------------------------
+
+    def marker_size_changed(self, value):
+        self.marker_size = int(
+            value
+        )
+
+        self.marker_size_label.setText(
+            f"{value} px"
+        )
+
+    # ------------------------------------------------------------------
+
+    def color_range_changed(self):
+        # Always keep the app-level endpoints in sync with the
+        # spin boxes; voltage_to_color() reads these values and
+        # silently falls back to blue when vmax <= vmin, which is
+        # exactly the "all markers are blue" symptom.
+        self.color_min = (
+            self.color_min_spin.value()
+        )
+
+        self.color_max = (
+            self.color_max_spin.value()
+        )
+
+        if self.color_max <= self.color_min:
+            # During programmatic auto-fit (export), transient
+            # intermediate states can briefly put min >= max; the
+            # final values are always valid, so skip the popup then.
+            if not getattr(self, "suppress_color_warning", False):
+                QMessageBox.warning(
+                    self,
+                    "Color Scale",
+                    "Maximum voltage must be greater than "
+                    "minimum voltage.",
+                )
+
+            return
+
+        self.canvas.render_image()
+
+    # ------------------------------------------------------------------
+
+    def rotation_changed(self, value):
+        self.canvas.set_rotation(value)
+
+    # ------------------------------------------------------------------
+
+    def reset_rotation(self):
+        self.rotation_spin.blockSignals(True)
+        self.rotation_spin.setValue(0.0)
+        self.rotation_spin.blockSignals(False)
+        self.canvas.set_rotation(0.0)
+
+    # ------------------------------------------------------------------
+
+    def open_image(self):
+        file_name, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Image",
+            "",
+            "Images (*.jpg *.jpeg *.png *.tif *.tiff)",
+        )
+
+        if not file_name:
+            return
+
+        self._load_image_file(file_name)
+
+    # ------------------------------------------------------------------
+
+    def _load_image_file(self, file_name):
+        """Open an image file and reset the marking state.
+
+        Shared by the "Open Image" button and session loading.  The
+        markers, undo/redo history and rotation are cleared exactly as
+        before; callers that restore a session re-apply their stored
+        values afterwards.  Returns True on success.
+
+        Opening a new image counts as starting a new session, so the
+        single autosave snapshot is overwritten right away (see
+        :meth:`autosave_session`).
+        """
+        try:
+            image = Image.open(
+                file_name
+            ).convert("RGB")
+
+            # Crop equally to square.
+            width, height = image.size
+
+            side = min(
+                width,
+                height,
+            )
+
+            left = (
+                width - side
+            ) // 2
+
+            top = (
+                height - side
+            ) // 2
+
+            image = image.crop(
+                (
+                    left,
+                    top,
+                    left + side,
+                    top + side,
+                )
+            )
+
+            # The color-scale range no longer prompts on import;
+            # the current Min/Max spin-box values are kept and can
+            # be adjusted later in the Color Scale panel.
+            self.markers = []
+            self.undo_stack = []
+            self.redo_stack = []
+
+            self.rotation_spin.blockSignals(
+                True
+            )
+
+            self.rotation_spin.setValue(
+                0.0
+            )
+
+            self.rotation_spin.blockSignals(
+                False
+            )
+
+            self.canvas.set_image(
+                image,
+                file_name,
+            )
+
+            # The marker list was reset together with the image.
+            self.update_marker_counter()
+
+            # Opening a *new* image starts a new session: mirror it to
+            # the autosave immediately so the previous session's
+            # snapshot is overwritten (there is only ever one autosave
+            # file).  Two moments during "Load Session" are skipped:
+            # while the stored markers are being re-applied
+            # (_loading_session) and right after a successful restore
+            # (_session_loaded_ok) — otherwise opening the session's
+            # own image would clobber the recovery snapshot with an
+            # empty marker list before the markers get restored.
+            if (
+                not getattr(self, "_loading_session", False)
+                and not getattr(self, "_session_loaded_ok", False)
+            ):
+                self.autosave_session()
+
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Open Image",
+                f"Could not open image:\n\n{exc}",
+            )
+            return False
+
+        return True
+
+    # ------------------------------------------------------------------
+    # Session save / load (JSON files, see SESSION_VERSION)
+    # ------------------------------------------------------------------
+
+    def _session_dir(self):
+        """Suggested folder for session dialogs.
+
+        Prefers the directory of the current session file, then the
+        directory of the open image, and falls back to the home folder.
+        """
+        if self.session_path:
+            return str(Path(self.session_path).parent)
+
+        if getattr(self.canvas, "image_path", None):
+            return str(Path(self.canvas.image_path).parent)
+
+        return str(Path.home())
+
+    # ------------------------------------------------------------------
+
+    def _default_session_name(self):
+        """Suggest <image name>.usmark.json next to the open image."""
+        image_path = getattr(self.canvas, "image_path", None)
+
+        if image_path:
+            return str(
+                Path(image_path).with_suffix("")
+            ) + SESSION_EXTENSION
+
+        return "session" + SESSION_EXTENSION
+
+    # ------------------------------------------------------------------
+
+    def build_session_data(self):
+        """Collect everything a session file must retain."""
+        shape_labels = {
+            name: edit.text()
+            for name, edit in self.shape_descriptions.items()
+        }
+
+        data = {
+            "app": "usmark_gui",
+            "version": SESSION_VERSION,
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "image": {
+                # Only the path is stored — never the pixels.  The
+                # crop offset lets a future version reload the exact
+                # square region even if the source file changed.
+                "path": getattr(self.canvas, "image_path", None),
+                "crop_offset_x": self.canvas.base_image.width // 2
+                if self.canvas.base_image is not None
+                else 0,
+                "crop_offset_y": self.canvas.base_image.height // 2
+                if self.canvas.base_image is not None
+                else 0,
+            },
+            "toolbar": {
+                "rotation": float(self.rotation_spin.value()),
+                "marker_size": int(self.marker_size),
+                "color_min": float(self.color_min_spin.value()),
+                "color_max": float(self.color_max_spin.value()),
+                "current_shape": getattr(self, "current_shape", "circle"),
+                "shape_labels": shape_labels,
+            },
+            "markers": marker_list_to_dicts(self.markers),
+            "guide": {
+                "spacing": float(self.canvas.guide_spacing),
+                "angle": float(self.canvas.guide_angle),
+                "offset_x": float(self.canvas.guide_offset_x),
+                "offset_y": float(self.canvas.guide_offset_y),
+                "applied": self.canvas.guide_mode == "applied",
+            },
+        }
+
+        # USMELT panel parameters are optional extras; older readers
+        # simply ignore this block.
+        melter = getattr(self, "melter", None)
+
+        if melter is not None:
+            data["melter"] = {
+                "use_shaping": bool(melter.use_shaping.isChecked()),
+                "shaping_v1": float(melter.shaping_v1),
+                "shaping_t1": float(melter.shaping_t1),
+                "shaping_v2": float(melter.shaping_v2),
+                "shaping_t2": float(melter.shaping_t2),
+                "melt_sound": bool(melter.melt_sound),
+            }
+
+        return data
+
+    # ------------------------------------------------------------------
+
+    def apply_session_data(self, data):
+        """Restore toolbar settings and markers from a session dict.
+
+        Returns a list of human-readable notes about anything that
+        could not be restored exactly (missing keys, unknown shapes…).
+        """
+        notes = []
+
+        toolbar = data.get("toolbar") or {}
+
+        # --- Shape legend labels (crucial) --------------------------
+        shape_labels = toolbar.get("shape_labels") or {}
+
+        for name, edit in self.shape_descriptions.items():
+            edit.setText(str(shape_labels.get(name, "")))
+
+        # --- Rotation (crucial) -------------------------------------
+        try:
+            rotation = float(toolbar.get("rotation", 0.0))
+        except (TypeError, ValueError):
+            rotation = 0.0
+            notes.append("Invalid rotation value; used 0°.")
+
+        self.rotation_spin.blockSignals(True)
+        self.rotation_spin.setValue(rotation)
+        self.rotation_spin.blockSignals(False)
+
+        self.canvas.set_rotation(rotation)
+
+        # --- Marker size ---------------------------------------------
+        try:
+            size = max(
+                self.marker_size_slider.minimum(),
+                min(int(toolbar.get("marker_size", self.marker_size)),
+                    self.marker_size_slider.maximum()),
+            )
+        except (TypeError, ValueError):
+            size = int(self.marker_size)
+            notes.append("Invalid marker size; kept the current value.")
+
+        self.marker_size_slider.setValue(size)
+
+        # --- Color scale ---------------------------------------------
+        try:
+            cmin = float(toolbar.get("color_min", self.color_min))
+            cmax = float(toolbar.get("color_max", self.color_max))
+        except (TypeError, ValueError):
+            cmin = self.color_min
+            cmax = self.color_max
+            notes.append("Invalid color scale values; kept the current ones.")
+
+        self.color_min_spin.setValue(cmin)
+        self.color_max_spin.setValue(cmax)
+
+        # --- Selected shape -------------------------------------------
+        shape = str(toolbar.get("current_shape", "circle"))
+
+        if shape in self.shape_buttons:
+            self.shape_buttons[shape].setChecked(True)
+            self.current_shape = shape
+        else:
+            self.shape_buttons["circle"].setChecked(True)
+            self.current_shape = "circle"
+
+            if shape != "circle":
+                notes.append(
+                    f"Unknown marker shape '{shape}'; selected circle."
+                )
+
+        # --- Markers ---------------------------------------------------
+        raw_markers = data.get("markers") or []
+
+        self.markers = marker_dicts_to_list(raw_markers)
+
+        restored = len(self.markers)
+
+        if restored != len(raw_markers):
+            notes.append(
+                f"{len(raw_markers) - restored} malformed marker entries "
+                "were skipped."
+            )
+
+        self.undo_stack = []
+        self.redo_stack = []
+
+        # Re-flag the most recently placed marker so the highlight ring
+        # survives an interrupted session.  If the file was saved by a
+        # version without the "last" key (or every flagged entry was
+        # dropped as malformed), fall back to the final marker in
+        # placement order — that is where the user left off anyway.
+        self.update_last_marker_flag()
+
+        self.canvas.set_markers(self.markers)
+
+        self.update_marker_counter()
+
+        # --- Guide mesh (optional; older sessions lack this block) --------
+        guide_data = data.get("guide")
+
+        if guide_data:
+            try:
+                self.canvas.guide_spacing = max(
+                    5.0, float(guide_data.get("spacing", 100.0)))
+                self.canvas.guide_angle = float(
+                    guide_data.get("angle", 0.0))
+                self.canvas.guide_offset_x = float(
+                    guide_data.get("offset_x", 0.0))
+                self.canvas.guide_offset_y = float(
+                    guide_data.get("offset_y", 0.0))
+
+                if guide_data.get("applied"):
+                    # Restore to applied state without re-triggering the
+                    # calibration flow; _update_guide_ui will sync buttons.
+                    self.canvas.guide_mode = "applied"
+                    self._update_guide_ui()
+                    self.canvas.update()
+            except (TypeError, ValueError):
+                notes.append(
+                    "Guide mesh parameters in the session were invalid; "
+                    "using defaults."
+                )
+
+        # --- Optional USMELT parameters --------------------------------
+        melter_data = data.get("melter")
+
+        if melter_data and hasattr(self, "melter"):
+            melter = self.melter
+
+            try:
+                melter.shaping_v1 = float(
+                    melter_data.get("shaping_v1", melter.shaping_v1))
+                melter.shaping_t1 = float(
+                    melter_data.get("shaping_t1", melter.shaping_t1))
+                melter.shaping_v2 = float(
+                    melter_data.get("shaping_v2", melter.shaping_v2))
+                melter.shaping_t2 = float(
+                    melter_data.get("shaping_t2", melter.shaping_t2))
+
+                melter.use_shaping.blockSignals(True)
+                melter.use_shaping.setChecked(
+                    bool(melter_data.get("use_shaping",
+                                         melter.use_shaping.isChecked()))
+                )
+                melter.use_shaping.blockSignals(False)
+
+                if "melt_sound" in melter_data:
+                    melt_sound = bool(melter_data["melt_sound"])
+
+                    melter.melt_sound = melt_sound
+
+                    self.melt_sound_action.blockSignals(True)
+                    self.melt_sound_action.setChecked(melt_sound)
+                    self.melt_sound_action.blockSignals(False)
+
+                # Shaping changes the effective CH1 voltage, which in
+                # turn drives marker colors and the status label.
+                melter.effective_voltage_changed.emit()
+
+            except (TypeError, ValueError):
+                notes.append(
+                    "USMELT parameters in the session were invalid; "
+                    "kept the current ones."
+                )
+
+        return notes
+
+    # ------------------------------------------------------------------
+
+    def save_session(self, file_name=None):
+        """Write the current marking session to a JSON file.
+
+        Also refreshes the autosave snapshot so crash protection
+        covers the newly saved state (and so the "Load Session"
+        prompt about unsaved changes disappears immediately).
+        """
+        if self.canvas.base_image is None:
+            QMessageBox.warning(
+                self,
+                "Save Session",
+                "No image is open, so there is nothing to save.",
+            )
+            return False
+
+        if file_name is None:
+            file_name, _selected = QFileDialog.getSaveFileName(
+                self,
+                "Save Session",
+                self._default_session_name(),
+                (
+                    f"USMARK Session (*{SESSION_EXTENSION});;"
+                    "JSON (*.json);;All Files (*)"
+                ),
+            )
+
+            if not file_name:
+                return False
+
+        file_name = str(file_name)
+
+        # Keep the conventional extension so Load can find the file.
+        if not file_name.lower().endswith(".json"):
+            file_name += SESSION_EXTENSION
+
+        data = self.build_session_data()
+
+        try:
+            _write_json_atomically(
+                file_name,
+                data,
+            )
+
+        except OSError as exc:
+            QMessageBox.critical(
+                self,
+                "Save Session",
+                f"Could not save session:\n\n{exc}",
+            )
+            return False
+
+        self.session_path = file_name
+        self._session_dirty = False
+        self._session_loaded_ok = True
+        self.update_window_title()
+
+        # The state is now safely on disk in the real session file, so
+        # the autosave snapshot is refreshed to match (and the recovery
+        # prompt disappears on the next start after a clean exit).
+        self.autosave_session()
+
+        self.statusBar().showMessage(
+            f"Session saved to {file_name}",
+            5000,
+        )
+
+        return True
+
+    # ------------------------------------------------------------------
+
+    def load_session_dialog(self, file_name=None):
+        """Ask for a session file (if needed) and restore it."""
+        if file_name is None:
+            file_name, _selected = QFileDialog.getOpenFileName(
+                self,
+                "Load Session",
+                self._session_dir(),
+                (
+                    f"USMARK Session (*{SESSION_EXTENSION});;"
+                    "JSON (*.json);;All Files (*)"
+                ),
+            )
+
+            if not file_name:
+                return False
+
+        if self._session_dirty:
+            answer = QMessageBox.question(
+                self,
+                "Load Session",
+                "The current session has unsaved changes.\n\n"
+                "Save them before loading another session?",
+                QMessageBox.Save
+                | QMessageBox.Discard
+                | QMessageBox.Cancel,
+                QMessageBox.Save,
+            )
+
+            if answer == QMessageBox.Cancel:
+                return False
+
+            if answer == QMessageBox.Save:
+                if not self.save_session():
+                    return False
+
+        return self.load_session(file_name)
+
+    # ------------------------------------------------------------------
+
+    def load_session(self, file_name):
+        """Restore a session previously written by :meth:`save_session`."""
+        file_name = str(file_name)
+
+        try:
+            with open(file_name, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+
+        except FileNotFoundError:
+            QMessageBox.critical(
+                self,
+                "Load Session",
+                f"Session file not found:\n\n{file_name}",
+            )
+            return False
+
+        except json.JSONDecodeError as exc:
+            QMessageBox.critical(
+                self,
+                "Load Session",
+                f"'{Path(file_name).name}' is not a valid session "
+                f"file (corrupted JSON):\n\n{exc}",
+            )
+            return False
+
+        except OSError as exc:
+            QMessageBox.critical(
+                self,
+                "Load Session",
+                f"Could not read session:\n\n{exc}",
+            )
+            return False
+
+        if not isinstance(data, dict) or "markers" not in data:
+            QMessageBox.critical(
+                self,
+                "Load Session",
+                f"'{Path(file_name).name}' does not look like a "
+                "USMARK session file.",
+            )
+            return False
+
+        try:
+            version = int(data.get("version", 0))
+        except (TypeError, ValueError):
+            version = 0
+
+        if version > SESSION_VERSION:
+            QMessageBox.warning(
+                self,
+                "Load Session",
+                f"This session was written by a newer version of the "
+                f"tool (file version {version}, supported "
+                f"{SESSION_VERSION}).\n\nI will load what I recognize; "
+                "unknown fields are ignored.",
+            )
+
+        # --- Reload the original image (only its path is stored) -----
+        image_info = data.get("image") or {}
+        image_path = image_info.get("path")
+
+        image_ok = True
+
+        if image_path:
+            if not os.path.isfile(image_path):
+                image_ok = False
+
+                QMessageBox.warning(
+                    self,
+                    "Load Session",
+                    "The image referenced by the session could not "
+                    f"be found:\n\n{image_path}\n\n"
+                    "Use \"Open Image\" to locate it manually; the "
+                    "markers will keep their saved coordinates.",
+                )
+            else:
+                image_ok = self._load_image_file(image_path)
+
+                if not image_ok:
+                    image_ok = False
+
+        # Re-applying the toolbar state below would otherwise flag the
+        # freshly loaded session as modified.
+        self._loading_session = True
+
+        # A fresh load starts from the stored state only; until the
+        # restore succeeds, opening the session's image must still be
+        # allowed to refresh the autosave (see _load_image_file).
+        self._session_loaded_ok = False
+
+        try:
+            notes = self.apply_session_data(data)
+        finally:
+            self._loading_session = False
+
+        self.session_path = file_name
+        self._session_dirty = False
+        self._session_loaded_ok = True
+        self.update_window_title()
+
+        # Mirror the restored session to the autosave so crash
+        # protection immediately covers the newly loaded state (this
+        # also overwrites whatever the previous session left there).
+        self.autosave_session()
+
+        messages = []
+
+        if not image_path:
+            messages.append("The session did not reference an image file.")
+        elif not image_ok:
+            messages.append("The session's image could not be reloaded.")
+
+        if notes:
+            messages.extend(notes)
+
+        if messages:
+            QMessageBox.information(
+                self,
+                "Load Session",
+                "Session loaded with warnings:\n\n• "
+                + "\n• ".join(messages),
+            )
+        else:
+            self.statusBar().showMessage(
+                f"Session loaded from {file_name}"
+                f" ({len(self.markers)} markers)",
+                5000,
+            )
+
+        return True
+
+    # ------------------------------------------------------------------
+
+    def maybe_save_session_on_close(self):
+        """Give the user a chance to persist unsaved session changes."""
+        if not self._session_dirty:
+            return True
+
+        answer = QMessageBox.question(
+            self,
+            "Unsaved Session",
+            "The current session has unsaved changes.\n\n"
+            "Save them before closing?",
+            QMessageBox.Save
+            | QMessageBox.Discard
+            | QMessageBox.Cancel,
+            QMessageBox.Save,
+        )
+
+        if answer == QMessageBox.Cancel:
+            return False
+
+        if answer == QMessageBox.Save:
+            return bool(self.save_session())
+
+        return True
+
+    # ------------------------------------------------------------------
+
+    def closeEvent(self, event):
+        """Clean shutdown: keep or drop the autosave snapshot.
+
+        The autosave exists purely for crash protection.  If the user
+        answers the "Unsaved Session" dialog without cancelling, they
+        made a conscious decision about the current state (saved, or
+        deliberately discarded), so the recovery snapshot is removed
+        and the next start opens with a blank slate.  If the app
+        crashes instead, this code never runs and the last autosave
+        stays available for recovery.
+        """
+        if not self.maybe_save_session_on_close():
+            event.ignore()
+            return
+
+        self.discard_autosave()
+
+        # Release the pulse generator's serial port so the next run of
+        # the program can open it again (an orphaned COM handle on
+        # Windows blocks re-opening until the process dies or the PC is
+        # restarted).
+        try:
+            self.melter.close_pg()
+        except Exception:
+            pass
+
+        super().closeEvent(event)
+
+    # ------------------------------------------------------------------
+
+    def export_image(self):
+        if self.canvas.base_image is None:
+            QMessageBox.warning(
+                self,
+                "Export",
+                "No image is open.",
+            )
+
+            return
+
+        file_name, selected_filter = (
+            QFileDialog.getSaveFileName(
+                self,
+                "Export Annotated Image",
+                "",
+                "PNG (*.png);;JPEG (*.jpg *.jpeg);;TIFF (*.tif *.tiff)",
+            )
+        )
+
+        if not file_name:
+            return
+
+        # --------------------------------------------------------------
+        # Auto-fit the voltage color scale to the placed markers:
+        #   Min = lowest marker voltage (all markers)
+        #   Max = highest non-test marker voltage (5 V "Test"
+        #         markers excluded)
+        # Done first, before anything is drawn, so both the on-image
+        # markers and the legend gradient use these values.
+        # --------------------------------------------------------------
+
+        self.auto_fit_color_scale()
+
+        try:
+            image = (
+                self.canvas.base_image.copy()
+            )
+
+            draw = ImageDraw.Draw(
+                image
+            )
+
+            # Draw markers.
+            for marker in self.markers:
+                if marker.is_test:
+                    fill = (
+                        255,
+                        0,
+                        0,
+                    )
+
+                else:
+                    fill = (
+                        self.canvas.voltage_to_color(
+                            marker.voltage
+                        )
+                    )
+
+                draw_marker_shape(
+                    draw,
+                    getattr(marker, "shape", "circle"),
+                    marker.x,
+                    marker.y,
+                    marker.size,
+                    fill,
+                )
+
+            # Rotate.
+            if abs(
+                self.canvas.rotation
+            ) > 1e-9:
+
+                image = image.rotate(
+                    self.canvas.rotation,
+                    expand=True,
+                    fillcolor=(
+                        30,
+                        30,
+                        30,
+                    ),
+                )
+
+            # ----------------------------------------------------------
+            # Legend (compact box in the top-right corner of the
+            # image).  The canvas is never widened, so the exported
+            # picture keeps its original size and background.
+            # ----------------------------------------------------------
+
+            key_items = self.shape_key_items()
+
+            (
+                canvas_w,
+                canvas_h,
+                legend_w,
+                legend_h,
+                legend_x,
+                legend_y,
+            ) = self.legend_layout(
+                image.width, image.height, key_items=key_items
+            )
+
+            image = self.create_legend(
+                image,
+                key_items=key_items,
+                place=(legend_w, legend_h, legend_x, legend_y),
+            )
+
+            image.save(
+                file_name
+            )
+
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Export",
+                f"Could not export image:\n\n{exc}",
+            )
+
+    # ------------------------------------------------------------------
+    # Voltage legend (drawn onto exported images)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _format_voltage(value):
+        """
+        Format a voltage for the legend labels: always two decimals
+        ("1.30", "5.00") with trailing zeros trimmed, but never fewer
+        than one decimal place ("1.3", "0.5", "5.0").
+        """
+        text = f"{float(value):.2f}".rstrip("0")
+
+        if text.endswith("."):
+            text += "0"
+
+        return text
+
+    def auto_fit_color_scale(self):
+        """
+        Derive the voltage color scale from the placed markers and
+        sync it to the Color Scale spin boxes:
+
+          Min = lowest voltage among all markers;
+          Max = highest voltage among non-test markers (5 V "Test"
+                markers are excluded).
+
+        When there are no markers at all, or the derived range is
+        degenerate (Max <= Min), the current manual values are kept.
+        """
+        voltages = [marker.voltage for marker in self.markers]
+
+        if not voltages:
+            return
+
+        regular = [
+            marker.voltage
+            for marker in self.markers
+            if not marker.is_test
+        ]
+
+        vmin = min(voltages)
+
+        if regular:
+            vmax = max(regular)
+
+        else:
+            # Only test markers on the image: keep the current max so
+            # the scale stays valid.
+            vmax = self.color_max
+
+        if vmax <= vmin:
+            return
+
+        # Update the spin boxes first: setValue() fires valueChanged,
+        # which routes through color_range_changed() and keeps the
+        # app-level values, the canvas rendering and the export legend
+        # all in sync.  Guard against the warning popup for the
+        # transient intermediate state (e.g. new min > old max).
+        self.suppress_color_warning = True
+
+        try:
+            self.color_min_spin.setValue(vmin)
+            self.color_max_spin.setValue(vmax)
+
+        finally:
+            self.suppress_color_warning = False
+
+        # Re-sync once more in case either value was already at its
+        # target (setValue() then emits nothing and the handler above
+        # returned early without updating both endpoints).
+        self.color_min = self.color_min_spin.value()
+        self.color_max = self.color_max_spin.value()
+
+        self.canvas.render_image()
+
+    def used_shapes(self):
+        """Distinct marker shapes present on the current image."""
+        seen = []
+        for marker in self.markers:
+            shape = getattr(marker, "shape", "circle")
+            if shape not in seen:
+                seen.append(shape)
+        return seen
+
+    def shape_key_items(self):
+        """
+        Build the shape/description key entries for the figure legend.
+
+        Returns a list of ``(shape_name, description)`` tuples, or an
+        empty list when no key is needed (fewer than two distinct
+        shapes on the image).  Shapes without a user description fall
+        back to their name.
+        """
+        shapes = self.used_shapes()
+
+        if len(shapes) < 2:
+            return []
+
+        items = []
+        for shape in shapes:
+            edit = self.shape_descriptions.get(shape)
+            desc = edit.text().strip() if edit is not None else ""
+            if not desc:
+                desc = shape.capitalize()
+            items.append((shape, desc))
+
+        return items
+
+    # Shape-key text wraps inside this fraction of the legend's
+    # design width (150 units); shared by the layout pass that sizes
+    # the box and the draw pass that renders the rows, so the two
+    # always agree on how many lines each label needs.
+    KEY_TEXT_WIDTH_UNITS = 100.0
+
+    # Extra design height added per wrapped line beyond the first in
+    # a shape-key row (base row band is 28 units).
+    KEY_LINE_EXTRA_UNITS = 22.0
+
+    # Smallest text column (design units) that wrapping ever targets;
+    # keeps the wrap budget positive for tiny legends and guarantees
+    # the sizing pass and the draw pass agree on the wrap width.
+    MIN_KEY_TEXT_UNITS = 40.0
+
+    @staticmethod
+    def _key_text_budget_units(s):
+        """
+        Pixel width available to wrapped key-label text at layout
+        scale ``s``: the space right of the shape icon, with a fixed
+        floor so both passes always use the same number.
+        """
+        used = max(ImageMarkerApp.MIN_KEY_TEXT_UNITS,
+                   ImageMarkerApp.KEY_TEXT_WIDTH_UNITS - 18.0)
+        return used * s
+
+    @staticmethod
+    def _key_row_line_counts(key_items, lw, lh):
+        """
+        Number of wrapped text lines each shape-key row needs at the
+        final legend geometry.
+
+        Returns a list aligned with ``key_items`` (>= 1 line per
+        entry).  Uses PIL metrics from the same font the drawing code
+        picks, so long labels get enough vertical room in the box
+        instead of running past its edge.
+        """
+        if not key_items:
+            return []
+
+        n_rows = len(key_items)
+
+        # Rough estimate first; create_legend refines s with the
+        # exact final lh, but the row heights are constant in design
+        # units so this converges immediately for any sane geometry.
+        design_h_est = 210.0 + 28.0 * n_rows
+        s_est = min(lw / 150.0, lh / design_h_est)
+
+        probe = Image.new("RGBA", (8, 8))
+        probe_draw = ImageDraw.Draw(probe)
+        label_font = ImageMarkerApp._legend_font(
+            max(9, int(round(16 * s_est)))
+        )
+
+        counts = []
+        for _, text in key_items:
+            lines = wrap_text_to_width(
+                probe_draw, str(text), label_font,
+                max(1.0, ImageMarkerApp._key_text_budget_units(s_est)),
+            )
+            counts.append(max(1, len(lines)))
+
+        return counts
+
+    @staticmethod
+    def legend_size(image_width, image_height, extra_rows=0,
+                    key_line_counts=None):
+        """
+        Legend box size scaled to the exported image.
+
+        The legend is a compact box: it keeps a fixed design aspect
+        ratio (width:height = 5:7 for the base grid) and grows only
+        with the image diagonal, capped so it stays a small annotation
+        in the top-right corner instead of dominating the figure.
+        Base design grid: 150 x 210 units for a 640 x 480 image, plus
+        28 vertical units per shape-key row added below the color
+        scale.
+
+        ``key_line_counts`` optionally gives the number of wrapped
+        text lines each shape-key row occupies (one entry per row);
+        rows with more than one line reserve extra height so their
+        labels stay fully visible instead of being cut off.
+        """
+        counts = list(key_line_counts or [])
+        n_rows = max(int(extra_rows), len(counts))
+
+        # Design height of the shape-key block: 28 units per row plus
+        # one extra line (22 units) for every wrapped line beyond the
+        # first; matches the line spacing used when drawing the rows.
+        key_block_units = sum(
+            28.0 + ImageMarkerApp.KEY_LINE_EXTRA_UNITS * max(0, c - 1)
+            for c in counts[:n_rows]
+        ) if counts else 28.0 * n_rows
+
+        design_w = 150.0
+        design_h = 210.0 + key_block_units
+
+        scale = math.sqrt(
+            image_width * image_height / (640.0 * 480.0)
+        )
+
+        width = int(round(design_w * scale))
+        height = int(round(design_h * scale))
+
+        # Compactness cap: keep the legend small relative to the
+        # picture (~1/6 of the width, ~1/4 of the height) so it reads
+        # as an annotation rather than covering the image.
+        cap_w = max(1, image_width // 6)
+        cap_h = max(1, image_height // 4)
+
+        k = min(1.0, cap_w / width, cap_h / height)
+        width = max(1, int(round(width * k)))
+        height = max(1, int(round(height * k)))
+
+        # Ceiling: the legend should never dominate the figure.
+        max_w = max(1, image_width // 3)
+        max_h = max(1, image_height)
+
+        if width > max_w or height > max_h:
+            k = min(max_w / width, max_h / height)
+            width = max(1, int(round(width * k)))
+            height = max(1, int(round(height * k)))
+
+        # Re-impose the design aspect ratio after any clamping above
+        # (shrink the offending dimension so the box stays sane).
+        if width / height > design_w / design_h:
+            width = max(1, int(round(height * design_w / design_h)))
+        else:
+            height = max(1, int(round(width * design_h / design_w)))
+
+        return width, height
+
+    def legend_layout(self, image_width, image_height, key_items=None):
+        """
+        Compute where the legend belongs for an export of an
+        ``image_width x image_height`` source image with ``key_items``
+        shape rows.
+
+        Returns ``(canvas_w, canvas_h, lw, lh, legend_x, legend_y)``.
+        The legend is always a compact box anchored to the top-right
+        corner of the image; the canvas is never widened (no white
+        strip is added around the picture).
+        """
+        n_rows = len(key_items) if key_items else 0
+
+        # First pass without wrap info, then measure how many lines
+        # the labels need at that geometry and resize so tall rows
+        # fit inside the box (labels never get cut off).
+        lw, lh = self.legend_size(image_width, image_height,
+                                  extra_rows=n_rows)
+
+        key_line_counts = self._key_row_line_counts(key_items, lw, lh)
+
+        if any(c > 1 for c in key_line_counts):
+            lw, lh = self.legend_size(
+                image_width, image_height,
+                extra_rows=n_rows,
+                key_line_counts=key_line_counts,
+            )
+
+        # Safety clamp: even for tiny images the legend must fit
+        # inside the picture with a small margin.
+        margin = max(4, int(round(lw * 0.10)))
+
+        while (lw + 2 * margin > image_width or
+               lh + 2 * margin > image_height) and lw > 10:
+            lw = max(1, int(round(lw * 0.9)))
+            lh = max(1, int(round(lh * 0.9)))
+            margin = max(4, int(round(lw * 0.10)))
+
+        return (
+            image_width,
+            image_height,
+            lw,
+            lh,
+            image_width - lw - margin,
+            margin,
+        )
+
+    @staticmethod
+    def _legend_font(size):
+        # Prefer a real TrueType font (crisper at large sizes); fall
+        # back to PIL's default bitmap/scaled font if unavailable.
+        for path in (
+            "C:/Windows/Fonts/arial.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ):
+            try:
+                return ImageFont.truetype(path, size)
+            except OSError:
+                continue
+
+        try:
+            return ImageFont.load_default(size=size)
+        except TypeError:  # older Pillow without the size parameter
+            return ImageFont.load_default()
+
+    def create_legend(self, image, key_items=None, place=None):
+        """
+        Composite a semi-transparent voltage-gradient legend onto the
+        top-right corner of ``image`` (an RGB PIL.Image).  Returns a new
+        RGB image; the input is not modified.
+
+        ``key_items`` is an optional list of ``(shape_name, text)``
+        tuples drawn beneath the color scale as a shape legend.
+
+        ``place`` optionally overrides the geometry with a tuple
+        ``(lw, lh, legend_x, legend_y)`` - used by the export path to
+        position the compact legend box in the top-right corner.
+        """
+        if key_items is None:
+            key_items = []
+
+        if place is not None:
+            lw, lh, legend_x, legend_y = place
+        else:
+            lw, lh = self.legend_size(
+                image.width, image.height, extra_rows=len(key_items)
+            )
+
+            # Layout unit: fit a 150 x 210 design grid (+28 units per key
+            # row) inside the box while keeping content proportions correct.
+            margin = max(4, int(round(lw * 0.10)))
+
+            legend_x = image.width - lw - margin
+            legend_y = margin
+
+        # Layout unit: fit a 150 x 210 design grid (+28 units per key
+        # row, plus one extra line of 22 units for every wrapped text
+        # line beyond the first) inside the box while keeping content
+        # proportions correct.
+        key_line_counts = self._key_row_line_counts(key_items, lw, lh)
+
+        key_block_units = sum(
+            28.0 + self.KEY_LINE_EXTRA_UNITS * max(0, c - 1)
+            for c in key_line_counts
+        ) if key_items else 0.0
+
+        design_h = 210.0 + key_block_units
+        s = min(lw / 150.0, lh / design_h)
+
+        # Center the design horizontally when the box is wider than tall
+        # proportions imply (e.g. after a height clamp).
+        ox = max(0.0, (lw - 150.0 * s) / 2.0)
+
+        overlay = Image.new(
+            "RGBA",
+            (lw, lh),
+            (255, 255, 255, 235),
+        )
+
+        od = ImageDraw.Draw(overlay)
+
+        border = max(2, int(round(2 * s)))
+
+        od.rectangle(
+            [0, 0, lw - 1, lh - 1],
+            outline=(0, 0, 0, 255),
+            width=border,
+        )
+
+        title_font = self._legend_font(max(10, int(round(20 * s))))
+        label_font = self._legend_font(max(9, int(round(16 * s))))
+
+        title = "Voltage (kV)"
+
+        tb = od.textbbox((0, 0), title, font=title_font)
+
+        od.text(
+            ((lw - (tb[2] - tb[0])) / 2.0, 12 * s),
+            title,
+            fill=(0, 0, 0, 255),
+            font=title_font,
+        )
+
+        # ----------------------------------------------------------
+        # Content is laid out in non-overlapping vertical bands:
+        #   title -> color scale -> shape-key rows -> Test line.
+        # The gradient bar only occupies the space left between the
+        # title and the bottom text block, so the scale and the
+        # description segments can never collide.
+        # ----------------------------------------------------------
+
+        # Bottom block height (shape-key rows + the Test line).
+        bottom_block = 30.0 * s if key_items else 24.0 * s
+        bottom_block += key_block_units * s
+
+        band_top = 45 * s
+        band_bottom = lh - bottom_block
+
+        # Gradient bar: blue (bottom, Min) -> cyan -> green -> yellow
+        # -> orange -> magenta (top, Max).  Narrower than before (bar
+        # takes ~1/3 of width).
+        bar_left = ox + 40 * s
+        bar_top = band_top
+        bar_width = 45 * s
+        bar_height = max(18.0 * s, band_bottom - band_top)
+
+        vmax = self.color_max
+        vmin = self.color_min
+
+        for i in range(int(bar_height)):
+            t = i / max(1.0, bar_height - 1.0)
+
+            color = self.canvas.voltage_to_color(
+                vmax - t * (vmax - vmin)
+            )
+
+            y = int(bar_top + i)
+
+            od.line(
+                [bar_left, y, bar_left + bar_width, y],
+                fill=(*color, 255),
+                width=1,
+            )
+
+        od.rectangle(
+            [
+                int(bar_left),
+                int(bar_top),
+                int(bar_left + bar_width),
+                int(bar_top + bar_height),
+            ],
+            outline=(0, 0, 0, 255),
+            width=1,
+        )
+
+        label_x = bar_left + bar_width + 12 * s
+
+        def draw_label(text, cy):
+            bbox = od.textbbox((0, 0), text, font=label_font)
+            th = bbox[3] - bbox[1]
+
+            od.text(
+                (label_x, cy - th / 2.0 - bbox[1]),
+                text,
+                fill=(0, 0, 0, 255),
+                font=label_font,
+            )
+
+        # ----------------------------------------------------------
+        # Scale labels: one per 0.05 V increment between Min and
+        # Max.  Max sits at the top of the color bar, Min at the
+        # bottom (matching the gradient direction), and each label
+        # is placed at its true height on the bar.  When the
+        # increments would collide (small box or wide range),
+        # every n-th increment is labelled so the labels stay
+        # readable and non-overlapping; the Max and Min end labels
+        # are always drawn.
+        # ----------------------------------------------------------
+
+        step = 0.05
+        n_steps = int(round((vmax - vmin) / step))
+
+        if n_steps < 1:
+            # Range narrower than one increment: label the two ends,
+            # Max on top and Min at the bottom.
+            values = [vmax, vmin]
+
+        else:
+            # Round each tick to 2 decimals against the float ladder
+            # to avoid binary-accumulation artifacts (1.3000000001).
+            values = [round(vmax - k * step, 2) for k in range(n_steps)]
+            values.append(vmin)
+
+        last = len(values) - 1
+
+        # Minimum vertical gap needed between two stacked labels.
+        probe_bbox = od.textbbox((0, 0), "0.00", font=label_font)
+        line_h = probe_bbox[3] - probe_bbox[1]
+        required_gap = line_h + max(2.0, 3.0 * s)
+
+        stride = 1
+        if last > 0 and bar_height > 0:
+            stride = max(
+                1,
+                int(math.ceil(required_gap / (bar_height / last))),
+            )
+
+        shown = []
+        for index, value in enumerate(values):
+            if index % stride == 0:
+                shown.append((index, value))
+
+        # Pin the very first (Max, top) and very last (Min, bottom)
+        # labels so the bar ends are always annotated.  When the tick
+        # count is not divisible by the stride, an added end label can
+        # land closer to its neighbour than one label height; drop the
+        # colliding interior label instead of overlapping it.
+        spacing = bar_height / max(1, last)
+
+        if shown[0][0] != 0:
+            shown.insert(0, (0, values[0]))
+
+            if len(shown) > 1:
+                if (shown[1][0] - 0) * spacing < required_gap:
+                    shown.pop(1)
+
+        if shown[-1][0] != last:
+            if len(shown) >= 2:
+                if (last - shown[-1][0]) * spacing < required_gap:
+                    shown.pop(-1)
+
+            shown.append((last, values[last]))
+
+        for index, value in shown:
+            t = index / max(1, last)
+            draw_label(
+                self._format_voltage(value),
+                bar_top + t * bar_height,
+            )
+
+        # ----------------------------------------------------------
+        # Bottom block: shape-key rows (if any) stacked above the
+        # "Test" line.  Rows are laid out sequentially from the bottom
+        # of the box upward, each in its own band (bands grow for
+        # labels that wrap onto several lines), so nothing can
+        # collide with the color scale above or with each other.
+        # ----------------------------------------------------------
+        icon_r = 8.0 * s
+        dot_r = 9.0 * s
+        icon_cx = ox + 15 * s
+
+        def draw_centered_text(text, cx_left, cy):
+            bbox = od.textbbox((0, 0), text, font=label_font)
+            od.text(
+                (cx_left, cy - (bbox[3] - bbox[1]) / 2.0 - bbox[1]),
+                text,
+                fill=(0, 0, 0, 255),
+                font=label_font,
+            )
+
+        # "Test = 5.00 V" line: always the last (bottom-most) row,
+        # vertically centered in its reserved band at the box bottom.
+        test_cy = lh - (15.0 * s if key_items else 12.0 * s)
+
+        od.ellipse(
+            [
+                icon_cx - dot_r,
+                test_cy - dot_r,
+                icon_cx + dot_r,
+                test_cy + dot_r,
+            ],
+            fill=(255, 0, 0, 255),
+            outline=(0, 0, 0, 255),
+            width=1,
+        )
+
+        draw_centered_text(
+            "Test = 5.00 V", icon_cx + dot_r + 10 * s, test_cy
+        )
+
+        # Shape key: one row per (shape, description) directly above
+        # the Test line.  Long descriptions wrap onto extra lines
+        # within the row's reserved band (the legend box was grown to
+        # fit them), so labels never run past the edge of the box.
+        # Rows are stacked bottom-up; ``row_bottom`` tracks the y of
+        # the lowest free pixel of the remaining stack.
+        line_gap_units = self.KEY_LINE_EXTRA_UNITS
+
+        row_bottom = test_cy - 15.0 * s
+
+        for (shape_name, text), n_lines in zip(
+            reversed(key_items), reversed(key_line_counts)
+        ):
+            block_h_units = 28.0 + line_gap_units * max(0, n_lines - 1)
+            block_h = block_h_units * s
+
+            cy = row_bottom - block_h / 2.0
+            row_bottom -= block_h
+
+            # Draw the shape itself (gray fill, black outline) so
+            # the key matches what appears on the image.
+            poly = None
+
+            if shape_name == "circle":
+                od.ellipse(
+                    [
+                        icon_cx - icon_r,
+                        cy - icon_r,
+                        icon_cx + icon_r,
+                        cy + icon_r,
+                    ],
+                    fill=(120, 120, 120, 255),
+                    outline=(0, 0, 0, 255),
+                    width=1,
+                )
+
+            elif shape_name == "square":
+                half = icon_r / math.sqrt(2.0)
+                od.polygon(
+                    [
+                        (icon_cx - half, cy - half),
+                        (icon_cx + half, cy - half),
+                        (icon_cx + half, cy + half),
+                        (icon_cx - half, cy + half),
+                    ],
+                    fill=(120, 120, 120, 255),
+                    outline=(0, 0, 0, 255),
+                    width=1,
+                )
+
+            elif shape_name == "triangle":
+                poly = [
+                    (
+                        icon_cx + icon_r * math.cos(
+                            math.radians(-90.0 + k * 120.0)
+                        ),
+                        cy + icon_r * math.sin(
+                            math.radians(-90.0 + k * 120.0)
+                        ),
+                    )
+                    for k in range(3)
+                ]
+                od.polygon(
+                    poly,
+                    fill=(120, 120, 120, 255),
+                    outline=(0, 0, 0, 255),
+                    width=1,
+                )
+
+            elif shape_name == "star":
+                inner = icon_r * 0.45
+                poly = []
+                for k in range(10):
+                    ang = math.radians(-90.0 + k * 36.0)
+                    rad = icon_r if k % 2 == 0 else inner
+                    poly.append(
+                        (
+                            icon_cx + rad * math.cos(ang),
+                            cy + rad * math.sin(ang),
+                        )
+                    )
+                od.polygon(
+                    poly,
+                    fill=(120, 120, 120, 255),
+                    outline=(0, 0, 0, 255),
+                    width=1,
+                )
+
+            elif shape_name == "diamond":
+                od.polygon(
+                    [
+                        (icon_cx,            cy - icon_r),
+                        (icon_cx + icon_r,   cy),
+                        (icon_cx,            cy + icon_r),
+                        (icon_cx - icon_r,   cy),
+                    ],
+                    fill=(120, 120, 120, 255),
+                    outline=(0, 0, 0, 255),
+                    width=1,
+                )
+
+            elif shape_name == "hexagon":
+                od.polygon(
+                    [
+                        (
+                            icon_cx + icon_r * math.cos(math.radians(k * 60.0)),
+                            cy      + icon_r * math.sin(math.radians(k * 60.0)),
+                        )
+                        for k in range(6)
+                    ],
+                    fill=(120, 120, 120, 255),
+                    outline=(0, 0, 0, 255),
+                    width=1,
+                )
+
+            text_x = icon_cx + icon_r + 10 * s
+
+            # Wrap the label inside the space left of the text column
+            # so a long description stays readable instead of being
+            # cut off at the legend's right edge.  The budget comes
+            # from the same helper the sizing pass used, so the box
+            # always has exactly enough room for these lines.
+            max_text_w = self._key_text_budget_units(s)
+
+            lines = wrap_text_to_width(
+                od, str(text), label_font, max(1.0, max_text_w)
+            )
+
+            line_bbox = od.textbbox((0, 0), "Ag", font=label_font)
+            line_h = (line_bbox[3] - line_bbox[1]) or (16.0 * s)
+
+            total_h = line_h * len(lines)
+
+            for line_index, line in enumerate(lines):
+                bbox = od.textbbox((0, 0), line, font=label_font)
+
+                od.text(
+                    (
+                        text_x,
+                        cy
+                        - total_h / 2.0
+                        + line_index * line_h
+                        - bbox[1],
+                    ),
+                    line,
+                    fill=(0, 0, 0, 255),
+                    font=label_font,
+                )
+
+        rgba = image.convert("RGBA")
+
+        rgba.alpha_composite(overlay, (int(legend_x), int(legend_y)))
+
+        return rgba.convert("RGB")
+
+
+# ----------------------------------------------------------------------
+# Application entry point
+# ----------------------------------------------------------------------
+
+def parse_args(argv=None):
+    """
+    Parse command-line options.
+
+    The only current option is offline mode (-o / --offline), which
+    starts the GUI without ever attempting to connect to the external
+    pulse generator (Melt is disabled, all parameter fields remain
+    editable for marking images).
+    """
+
+    parser = argparse.ArgumentParser(
+        prog="usmark_gui",
+        description=(
+            "USMELT + Image Marker. Combine image marking with "
+            "pulse-generator control."
+        ),
+    )
+
+    parser.add_argument(
+        "-o",
+        "--offline",
+        action="store_true",
+        help=(
+            "Run without connecting to the external pulse "
+            "generator. The Melt button is disabled, but images "
+            "can still be marked and exported."
+        ),
+    )
+
+    # Qt occasionally leaves extra args in sys.argv; ignore unknown
+    # options instead of erroring out on them.
+    args, _unknown = parser.parse_known_args(argv)
+
+    return args
+
+
+def main():
+    args = parse_args()
+
+    # Make the flag available module-wide so any component created
+    # later (e.g. MelterPanel via its default) picks it up too.
+    global OFFLINE_MODE
+
+    OFFLINE_MODE = True  # mark_only always runs offline
+
+    if OFFLINE_MODE:
+        print(
+            "Offline mode: no attempt will be made to connect "
+            "to the pulse generator."
+        )
+
+    # QApplication takes a *clean* argv (no our flags), otherwise
+    # Qt may choke on the unrecognized -o/--offline arguments.
+    app = QApplication(
+        [sys.argv[0]]
+    )
+
+    window = ImageMarkerApp(
+        offline=OFFLINE_MODE
+    )
+
+    window.show()
+
+    # Make absolutely sure the pulse generator's serial port gets
+    # released when this process ends -- even if the app is killed or
+    # crashes before closeEvent() runs.  On Windows, a lingering open
+    # handle on COM6 causes "PermissionError(13, 'Access is denied.')"
+    # the next time the program is started (sometimes only fixable by
+    # a reboot).
+    atexit.register(window.melter.close_pg)
+
+    # Crash protection: if a previous run ended unexpectedly, the
+    # autosave from that session is still on disk — offer to reopen it
+    # so the user can continue where they left off.
+    window.maybe_restore_autosave_on_startup()
+
+    sys.exit(
+        app.exec()
+    )
+
+
+if __name__ == "__main__":
+    main()
